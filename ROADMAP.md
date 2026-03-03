@@ -274,3 +274,237 @@ smtp_client.py ←  config, exceptions
 server.py      ←  config, models, imap_client, smtp_client
 __main__.py    ←  server
 ```
+
+---
+
+## iCloud Mail MCP — Planned Features
+
+Features planejadas para evolucao do servidor MCP. Cada phase implementa uma feature completa (codigo + testes + verificacao), seguindo o mesmo padrao das phases 0–7.
+
+---
+
+## Phase 8: mark_as_read / mark_as_unread
+
+**Objetivo**: Marcar mensagens como lidas ou nao-lidas pelo UID via IMAP STORE flags.
+
+**Arquivos modificados**:
+- `src/icloud_mail_mcp/imap_client.py` — novos metodos `mark_as_read(folder, uid)` e `mark_as_unread(folder, uid)` no `IMAPClient`. Usam `STORE +FLAGS (\Seen)` e `STORE -FLAGS (\Seen)`.
+- `src/icloud_mail_mcp/server.py` — 2 novos tools: `mark_as_read(ctx, folder, uid)` e `mark_as_unread(ctx, folder, uid)`.
+- `tests/test_imap_client.py` — testes para ambos os metodos (sucesso, UID inexistente).
+- `tests/test_server.py` — testes para os 2 tool handlers.
+
+**Verificacao**: `uv run ruff check . && uv run mypy src/ && uv run pytest -v`
+
+---
+
+## Phase 9: flag_email / unflag_email
+
+**Objetivo**: Adicionar ou remover a flag de destaque (star) em mensagens pelo UID.
+
+**Arquivos modificados**:
+- `src/icloud_mail_mcp/imap_client.py` — novos metodos `flag_email(folder, uid)` e `unflag_email(folder, uid)`. Usam `STORE +FLAGS (\Flagged)` e `STORE -FLAGS (\Flagged)`.
+- `src/icloud_mail_mcp/server.py` — 2 novos tools: `flag_email(ctx, folder, uid)` e `unflag_email(ctx, folder, uid)`.
+- `tests/test_imap_client.py` — testes para ambos os metodos.
+- `tests/test_server.py` — testes para os 2 tool handlers.
+
+**Verificacao**: `uv run ruff check . && uv run mypy src/ && uv run pytest -v`
+
+---
+
+## Phase 10: bulk_action
+
+**Objetivo**: Aplicar acoes em lote (move, delete, mark_read, mark_unread, flag, unflag) a multiplos UIDs de uma vez.
+
+**Arquivos modificados**:
+- `src/icloud_mail_mcp/imap_client.py` — novo metodo `bulk_action(folder, uids: list[str], action: str, destination: str | None = None) -> dict`. Executa a acao usando UID set no IMAP (e.g., `1,2,3`). Retorna `{"success_count": int, "fail_count": int}`.
+- `src/icloud_mail_mcp/server.py` — novo tool `bulk_action(ctx, folder, uids, action, destination?)`.
+- `tests/test_imap_client.py` — testes para cada tipo de acao, UIDs invalidos, e lista vazia.
+- `tests/test_server.py` — teste para o tool handler.
+
+**Verificacao**: `uv run ruff check . && uv run mypy src/ && uv run pytest -v`
+
+---
+
+## Phase 11: sort_order em list_emails
+
+**Objetivo**: Parametro `sort_order` para controlar ordem de listagem (ascendente/descendente por data).
+
+**Arquivos modificados**:
+- `src/icloud_mail_mcp/imap_client.py` — parametro `sort_order: str = "desc"` em `list_emails()`. `"desc"` = mais recentes primeiro (atual), `"asc"` = mais antigos primeiro.
+- `src/icloud_mail_mcp/server.py` — parametro `sort_order` propagado no tool `list_emails`.
+- `tests/test_imap_client.py` — testes para ambas as direcoes de ordenacao.
+- `tests/test_server.py` — teste do handler com sort_order.
+
+**Verificacao**: `uv run ruff check . && uv run mypy src/ && uv run pytest -v`
+
+---
+
+## ~~Phase 12: total_count em list_emails~~ ✓
+
+**Objetivo**: Incluir contagem total de emails na resposta de `list_emails` para suporte a paginacao.
+
+**Arquivos modificados**:
+- `src/icloud_mail_mcp/models.py` — novo modelo `EmailListResult` com campos `emails: list[Email]` e `total_count: int`.
+- `src/icloud_mail_mcp/imap_client.py` — `list_emails()` retorna `EmailListResult` em vez de `list[Email]`. `total_count` reflete o total de mensagens na folder, independente de limit/offset.
+- `src/icloud_mail_mcp/server.py` — tool `list_emails` adapta retorno para incluir `total_count`.
+- `tests/test_imap_client.py` — testes verificando `total_count` correto com diferentes limit/offset.
+- `tests/test_server.py` — teste do handler verificando campo `total_count`.
+
+**Verificacao**: `uv run ruff check . && uv run mypy src/ && uv run pytest -v`
+
+---
+
+## Phase 13: Filtros adicionais em search_emails
+
+**Objetivo**: Novos parametros de busca: status de leitura, flag, tamanho minimo e presenca de anexos.
+
+**Arquivos modificados**:
+- `src/icloud_mail_mcp/models.py` — novos campos opcionais no `SearchQuery`: `is_read: bool | None`, `is_flagged: bool | None`, `min_size: int | None`, `has_attachments: bool | None`.
+- `src/icloud_mail_mcp/imap_client.py` — `_build_search_criteria()` mapeia: `is_read` → SEEN/UNSEEN, `is_flagged` → FLAGGED/UNFLAGGED, `min_size` → LARGER, `has_attachments` → heuristica via Content-Type. Combinados com AND.
+- `src/icloud_mail_mcp/server.py` — parametros propagados no tool `search_emails`.
+- `tests/test_imap_client.py` — testes para cada filtro isolado e em combinacao.
+- `tests/test_server.py` — teste do handler com novos parametros.
+
+**Verificacao**: `uv run ruff check . && uv run mypy src/ && uv run pytest -v`
+
+---
+
+## Phase 14: download_attachment
+
+**Objetivo**: Download de um anexo especifico pelo UID da mensagem e nome do arquivo.
+
+**Arquivos modificados**:
+- `src/icloud_mail_mcp/imap_client.py` — novo metodo `download_attachment(folder, uid, filename) -> dict`. Faz FETCH RFC822, localiza o attachment pelo filename, retorna `{"filename": str, "content_type": str, "data": str}` com conteudo em base64. Raises erro se o anexo nao existir.
+- `src/icloud_mail_mcp/server.py` — novo tool `download_attachment(ctx, folder, uid, filename)`.
+- `tests/test_imap_client.py` — testes com mock de mensagem multipart (anexo encontrado, anexo inexistente).
+- `tests/test_server.py` — teste para o tool handler.
+
+**Verificacao**: `uv run ruff check . && uv run mypy src/ && uv run pytest -v`
+
+---
+
+## Phase 15: list_attachments
+
+**Objetivo**: Listar anexos de uma mensagem sem buscar o corpo completo do email.
+
+**Arquivos modificados**:
+- `src/icloud_mail_mcp/imap_client.py` — novo metodo `list_attachments(folder, uid) -> list[Attachment]`. Usa FETCH BODYSTRUCTURE para obter metadata (filename, content_type, size) sem download do conteudo.
+- `src/icloud_mail_mcp/server.py` — novo tool `list_attachments(ctx, folder, uid)`.
+- `tests/test_imap_client.py` — testes com mock de BODYSTRUCTURE response (com e sem anexos).
+- `tests/test_server.py` — teste para o tool handler.
+
+**Verificacao**: `uv run ruff check . && uv run mypy src/ && uv run pytest -v`
+
+---
+
+## Phase 16: rename_folder
+
+**Objetivo**: Renomear uma pasta existente no mailbox via IMAP RENAME.
+
+**Arquivos modificados**:
+- `src/icloud_mail_mcp/imap_client.py` — novo metodo `rename_folder(old_name, new_name) -> Folder`. Usa comando IMAP RENAME. Raises `IMAPConnectionError` se a pasta nao existir.
+- `src/icloud_mail_mcp/server.py` — novo tool `rename_folder(ctx, old_name, new_name)`.
+- `tests/test_imap_client.py` — testes cobrindo sucesso e pasta inexistente.
+- `tests/test_server.py` — teste para o tool handler.
+
+**Verificacao**: `uv run ruff check . && uv run mypy src/ && uv run pytest -v`
+
+---
+
+## Phase 17: delete_folder
+
+**Objetivo**: Remover uma pasta do mailbox via IMAP DELETE.
+
+**Arquivos modificados**:
+- `src/icloud_mail_mcp/imap_client.py` — novo metodo `delete_folder(name) -> dict`. Usa comando IMAP DELETE. Raises erro se a pasta nao existir ou contiver mensagens.
+- `src/icloud_mail_mcp/server.py` — novo tool `delete_folder(ctx, name)`.
+- `tests/test_imap_client.py` — testes cobrindo sucesso, pasta inexistente e pasta nao-vazia.
+- `tests/test_server.py` — teste para o tool handler.
+
+**Verificacao**: `uv run ruff check . && uv run mypy src/ && uv run pytest -v`
+
+---
+
+## Phase 18: get_folder_stats
+
+**Objetivo**: Retornar contagem total e de mensagens nao-lidas por pasta via IMAP STATUS.
+
+**Arquivos modificados**:
+- `src/icloud_mail_mcp/imap_client.py` — novo metodo `get_folder_stats(folder) -> dict`. Usa `STATUS folder (MESSAGES UNSEEN)`. Retorna `{"total": int, "unread": int}`.
+- `src/icloud_mail_mcp/server.py` — novo tool `get_folder_stats(ctx, folder)`.
+- `tests/test_imap_client.py` — testes com mock de STATUS response.
+- `tests/test_server.py` — teste para o tool handler.
+
+**Verificacao**: `uv run ruff check . && uv run mypy src/ && uv run pytest -v`
+
+---
+
+## Phase 19: save_draft
+
+**Objetivo**: Salvar um rascunho no servidor sem enviar, usando IMAP APPEND.
+
+**Arquivos modificados**:
+- `src/icloud_mail_mcp/imap_client.py` — novo metodo `save_draft(to, subject, body, cc?) -> dict`. Constroi `EmailMessage` e usa IMAP APPEND na pasta `"Drafts"` com flag `\Draft`. Retorna `{"status": "saved", "uid": str}`.
+- `src/icloud_mail_mcp/server.py` — novo tool `save_draft(ctx, to, subject, body, cc?)`.
+- `tests/test_imap_client.py` — testes com mock de APPEND (sucesso e falha).
+- `tests/test_server.py` — teste para o tool handler.
+
+**Verificacao**: `uv run ruff check . && uv run mypy src/ && uv run pytest -v`
+
+---
+
+## Phase 20: reply_email / forward_email
+
+**Objetivo**: Responder ou encaminhar emails existentes, referenciando o UID original via headers In-Reply-To/References.
+
+**Arquivos modificados**:
+- `src/icloud_mail_mcp/imap_client.py` — helper para buscar Message-ID e headers do email original.
+- `src/icloud_mail_mcp/smtp_client.py` — novos metodos `reply_email(original_email, body, reply_all)` e `forward_email(original_email, to, body?)`. Constroem headers In-Reply-To/References. Reply preenche To/Cc automaticamente a partir do original; forward anexa corpo original como citacao.
+- `src/icloud_mail_mcp/server.py` — 2 novos tools: `reply_email(ctx, folder, uid, body, reply_all?)` e `forward_email(ctx, folder, uid, to, body?)`.
+- `tests/test_smtp_client.py` — testes para reply, reply_all e forward (headers corretos, destinatarios).
+- `tests/test_server.py` — testes para os 2 tool handlers.
+
+**Verificacao**: `uv run ruff check . && uv run mypy src/ && uv run pytest -v`
+
+---
+
+## Phase 21: list_rules / create_rule
+
+**Objetivo**: Gerenciar regras de filtragem automatica de emails armazenadas localmente.
+
+**Nota**: iCloud IMAP nao suporta SIEVE nativamente. Regras sao armazenadas em arquivo JSON local e aplicadas via execucao manual.
+
+**Arquivos criados/modificados**:
+- `src/icloud_mail_mcp/rules.py` — novo modulo. Classe `RulesEngine` que gerencia regras em JSON file (`~/.icloud_mail_mcp/rules.json`). Metodos: `list_rules()`, `create_rule(name, conditions, actions)`, `delete_rule(name)`, `apply_rules(folder, imap_client)`.
+- `src/icloud_mail_mcp/models.py` — novos modelos `Rule` e `RuleCondition`.
+- `src/icloud_mail_mcp/server.py` — 3 novos tools: `list_rules(ctx)`, `create_rule(ctx, name, conditions, actions)`, `apply_rules(ctx, folder)`.
+- `tests/test_rules.py` — novo arquivo de testes. CRUD de regras e aplicacao a mensagens mock.
+- `tests/test_server.py` — testes para os 3 tool handlers.
+
+**Verificacao**: `uv run ruff check . && uv run mypy src/ && uv run pytest -v`
+
+---
+
+## Grafo de Dependencias (Phases 8–21)
+
+```
+Phase 8  (mark_as_read/unread)     ← IMAP STORE flags basico
+Phase 9  (flag/unflag)             ← mesmo padrao da Phase 8
+Phase 10 (bulk_action)             ← depende de 8 e 9 (reutiliza logica de flags)
+  │
+Phase 11 (sort_order)              ← independente
+Phase 12 (total_count)             ← independente
+Phase 13 (filtros search)          ← independente
+  │
+Phase 14 (download_attachment)     ← independente
+Phase 15 (list_attachments)        ← independente (pode ser paralela com 14)
+  │
+Phase 16 (rename_folder)           ← independente
+Phase 17 (delete_folder)           ← independente
+Phase 18 (get_folder_stats)        ← independente
+  │
+Phase 19 (save_draft)              ← independente
+Phase 20 (reply/forward)           ← depende de SMTP + IMAP existentes
+  │
+Phase 21 (rules/filters)           ← depende de todas as acoes anteriores (aplica move, flag, etc.)
+```

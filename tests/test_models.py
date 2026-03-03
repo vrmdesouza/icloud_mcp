@@ -5,7 +5,7 @@ from datetime import datetime
 import pytest
 from pydantic import ValidationError
 
-from icloud_mail_mcp.models import Email, Folder, SearchQuery
+from icloud_mail_mcp.models import Email, Folder, RuleAction, RuleCondition, SearchQuery
 
 
 def test_email_defaults() -> None:
@@ -68,3 +68,62 @@ def test_folder_model() -> None:
     assert folder2.name == "Sent Messages"
     assert folder2.delimiter == "."
     assert "\\HasNoChildren" in folder2.flags
+
+
+def test_email_threading_fields() -> None:
+    """Email threading fields default to None and store values when provided."""
+    email = Email(uid="1", folder="INBOX")
+    assert email.message_id is None
+    assert email.in_reply_to is None
+    assert email.references is None
+    assert email.reply_to is None
+
+    email2 = Email(
+        uid="2",
+        folder="INBOX",
+        message_id="<abc@mail.example.com>",
+        in_reply_to="<parent@mail.example.com>",
+        references="<root@mail.example.com> <parent@mail.example.com>",
+        reply_to="reply@example.com",
+    )
+    assert email2.message_id == "<abc@mail.example.com>"
+    assert email2.in_reply_to == "<parent@mail.example.com>"
+    assert email2.references == "<root@mail.example.com> <parent@mail.example.com>"
+    assert email2.reply_to == "reply@example.com"
+
+    data = email2.model_dump(mode="json")
+    restored = Email.model_validate(data)
+    assert restored.message_id == email2.message_id
+    assert restored.in_reply_to == email2.in_reply_to
+    assert restored.references == email2.references
+    assert restored.reply_to == email2.reply_to
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Batch 5: Literal type constraints on RuleCondition / RuleAction
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_rule_condition_valid_literals() -> None:
+    """RuleCondition accepts valid field and operator Literal values."""
+    cond = RuleCondition(field="sender", operator="contains", value="test")
+    assert cond.field == "sender"
+    assert cond.operator == "contains"
+
+
+def test_rule_condition_invalid_field_raises() -> None:
+    """RuleCondition rejects an invalid field value via pydantic validation."""
+    with pytest.raises(ValidationError):
+        RuleCondition(field="date", operator="equals", value="x")
+
+
+def test_rule_condition_invalid_operator_raises() -> None:
+    """RuleCondition rejects an invalid operator value via pydantic validation."""
+    with pytest.raises(ValidationError):
+        RuleCondition(field="sender", operator="regex", value="x")
+
+
+def test_rule_action_invalid_type_raises() -> None:
+    """RuleAction rejects an invalid action_type via pydantic validation."""
+    with pytest.raises(ValidationError):
+        RuleAction(action_type="archive")

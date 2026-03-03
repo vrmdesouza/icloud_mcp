@@ -1,6 +1,10 @@
 """Shared test fixtures for icloud_mail_mcp tests."""
 
 from collections.abc import Callable, Generator
+from email import encoders
+from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -56,6 +60,7 @@ def mock_imap_conn(mock_imap_response: Callable[[str, list[Any]], MagicMock]) ->
     conn.uid.return_value = ok
     conn.expunge.return_value = ok
     conn.create.return_value = ok
+    conn.append.return_value = ok
     return conn
 
 
@@ -82,3 +87,37 @@ def sample_email_bytes() -> bytes:
         b"\r\n"
         b"Hello, this is the email body.\r\n"
     )
+
+
+@pytest.fixture(scope="module")
+def encoded_header_email_bytes() -> bytes:
+    """RFC 822 email with Q-encoded Subject and base64-encoded From header."""
+    return (
+        b"From: =?utf-8?B?Sm/Do28gU2lsdmE=?= <joao@example.com>\r\n"
+        b"To: recipient@example.com\r\n"
+        b"Subject: =?utf-8?Q?Relat=C3=B3rio_Mensal?=\r\n"
+        b"Date: Mon, 01 Jan 2024 12:00:00 +0000\r\n"
+        b"Content-Type: text/plain; charset=utf-8\r\n"
+        b"\r\n"
+        b"Body content.\r\n"
+    )
+
+
+@pytest.fixture(scope="module")
+def multipart_email_bytes() -> bytes:
+    """RFC 822 multipart/mixed email bytes with a text body and a PDF attachment."""
+    msg = MIMEMultipart("mixed")
+    msg["From"] = "sender@example.com"
+    msg["To"] = "recipient@example.com"
+    msg["Subject"] = "Email with attachment"
+
+    body = MIMEText("This email has an attachment.", "plain", "utf-8")
+    msg.attach(body)
+
+    pdf_part = MIMEBase("application", "pdf")
+    pdf_part.set_payload(b"fake PDF content for testing")
+    encoders.encode_base64(pdf_part)
+    pdf_part.add_header("Content-Disposition", "attachment", filename="report.pdf")
+    msg.attach(pdf_part)
+
+    return msg.as_bytes()

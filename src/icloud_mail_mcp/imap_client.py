@@ -1,6 +1,7 @@
 """Persistent IMAP connection pool and all email read/search/management operations."""
 
 import asyncio
+import base64
 import email
 import email.header
 import email.message
@@ -10,20 +11,34 @@ import re
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import date, datetime
-from typing import TypeVar, cast
+from typing import Any, TypeVar, cast
 
 import aioimaplib
 from aioimaplib import IMAP4_SSL
 
 from icloud_mail_mcp.config import ICloudMailSettings
 from icloud_mail_mcp.exceptions import IMAPAuthenticationError, IMAPConnectionError
-from icloud_mail_mcp.models import Attachment, Email, Folder, SearchQuery
+from icloud_mail_mcp.models import (
+    Attachment,
+    Email,
+    EmailListResult,
+    Folder,
+    FolderStats,
+    SearchQuery,
+)
 
 T = TypeVar("T")
 log = logging.getLogger(__name__)
 
 ICLOUD_TRASH_FOLDER = "Deleted Messages"
 RETRY_DELAYS: tuple[float, ...] = (1.0, 2.0, 4.0)
+
+_BULK_STORE_ACTIONS: dict[str, tuple[str, str]] = {
+    "mark_as_read": ("+FLAGS.SILENT", "(\\Seen)"),
+    "mark_as_unread": ("-FLAGS.SILENT", "(\\Seen)"),
+    "flag": ("+FLAGS.SILENT", "(\\Flagged)"),
+    "unflag": ("-FLAGS.SILENT", "(\\Flagged)"),
+}
 
 _MONTHS: dict[int, str] = {
     1: "Jan",
@@ -44,6 +59,12 @@ _LIST_PATTERN = re.compile(rb'\((?P<flags>[^)]*)\)\s+"(?P<delim>[^"]*)"\s+(?P<na
 _FETCH_PATTERN = re.compile(rb"\d+ FETCH \(")
 _UID_PATTERN = re.compile(rb"UID (\d+)")
 _FLAGS_PATTERN = re.compile(rb"FLAGS \(([^)]*)\)")
+_BODYSTRUCTURE_RE = re.compile(rb"BODYSTRUCTURE\s*\(", re.IGNORECASE)
+
+_HEADER_FIELDS = (
+    "(FLAGS BODY.PEEK[HEADER.FIELDS "
+    "(FROM TO CC SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES REPLY-TO)])"
+)
 
 
 def _decode_header(value: str | None) -> str:
@@ -174,6 +195,11 @@ def _parse_email(
     cc_raw = _decode_header(msg.get("Cc", ""))
     cc = [a.strip() for a in cc_raw.split(",") if a.strip()]
 
+    message_id = msg.get("Message-ID", "") or None
+    in_reply_to = msg.get("In-Reply-To", "") or None
+    references = msg.get("References", "") or None
+    reply_to = _decode_header(msg.get("Reply-To", "")) or None
+
     date_parsed: datetime | None = None
     try:
         date_str = msg.get("Date", "")
@@ -194,6 +220,10 @@ def _parse_email(
             cc=cc,
             date=date_parsed,
             is_read=is_read,
+            message_id=message_id,
+            in_reply_to=in_reply_to,
+            references=references,
+            reply_to=reply_to,
         )
 
     body_text = ""
@@ -258,10 +288,77 @@ def _parse_email(
         cc=cc,
         date=date_parsed,
         is_read=is_read,
+        message_id=message_id,
+        in_reply_to=in_reply_to,
+        references=references,
+        reply_to=reply_to,
         body_text=body_text,
         body_html=body_html,
         attachments=attachments,
     )
+
+
+def _extract_attachment(raw_bytes: bytes, filename: str) -> dict[str, str]:
+    """Locate a named attachment in raw email bytes and return its base64-encoded content.
+
+    Args:
+        raw_bytes: Raw RFC 822 email bytes containing the message.
+        filename: The filename of the attachment to extract.
+
+    Returns:
+        Dict with ``filename``, ``content_type``, and ``data`` (base64-encoded ASCII) keys.
+
+    Raises:
+        IMAPConnectionError: If the attachment is not found or message parsing fails.
+    """
+    try:
+        msg = email.message_from_bytes(raw_bytes)
+    except Exception as exc:
+        raise IMAPConnectionError(
+            f"Falha ao processar a mensagem para extrair anexo '{filename}'."
+        ) from exc
+    for part in msg.walk():
+        raw_filename = part.get_filename()
+        if raw_filename is None:
+            continue
+        decoded_filename = _decode_header(str(raw_filename))
+        if decoded_filename == filename:
+            payload = cast(bytes | None, part.get_payload(decode=True))
+            data = base64.b64encode(payload if payload is not None else b"").decode("ascii")
+            return {
+                "filename": decoded_filename,
+                "content_type": part.get_content_type(),
+                "data": data,
+            }
+    raise IMAPConnectionError(f"Anexo '{filename}' não encontrado na mensagem.")
+
+
+def _sanitize_imap_string(value: str) -> str:
+    """Remove characters that could break IMAP quoted-string syntax.
+
+    RFC 3501 quoted-strings do not support escaping ``"`` or ``\\`` inside
+    the quotes.  Stripping them prevents IMAP search injection.
+
+    Args:
+        value: Raw user input string.
+
+    Returns:
+        Sanitized string safe for use in IMAP quoted-string context.
+    """
+    return value.replace("\\", "").replace('"', "")
+
+
+def _validate_uid(uid: str) -> None:
+    """Validate that a UID string is purely numeric.
+
+    Args:
+        uid: The UID string to validate.
+
+    Raises:
+        ValueError: If ``uid`` contains non-digit characters.
+    """
+    if not uid.isdigit():
+        raise ValueError(f"UID inválido: '{uid}'. O UID deve ser numérico.")
 
 
 def _build_search_criteria(query: SearchQuery) -> list[str]:
@@ -278,18 +375,254 @@ def _build_search_criteria(query: SearchQuery) -> list[str]:
     """
     criteria: list[str] = []
     if query.sender:
-        criteria.extend(["FROM", f'"{query.sender}"'])
+        criteria.extend(["FROM", f'"{_sanitize_imap_string(query.sender)}"'])
     if query.subject:
-        criteria.extend(["SUBJECT", f'"{query.subject}"'])
+        criteria.extend(["SUBJECT", f'"{_sanitize_imap_string(query.subject)}"'])
     if query.since:
         criteria.extend(["SINCE", _date_to_imap(query.since)])
     if query.before:
         criteria.extend(["BEFORE", _date_to_imap(query.before)])
     if query.body:
-        criteria.extend(["BODY", f'"{query.body}"'])
+        criteria.extend(["BODY", f'"{_sanitize_imap_string(query.body)}"'])
+    if query.is_read is True:
+        criteria.append("SEEN")
+    elif query.is_read is False:
+        criteria.append("UNSEEN")
+    if query.is_flagged is True:
+        criteria.append("FLAGGED")
+    elif query.is_flagged is False:
+        criteria.append("UNFLAGGED")
+    if query.min_size is not None:
+        criteria.extend(["LARGER", str(query.min_size)])
+    if query.has_attachments is True:
+        criteria.extend(["HEADER", "Content-Type", '"multipart/mixed"'])
+    elif query.has_attachments is False:
+        criteria.extend(["NOT", "HEADER", "Content-Type", '"multipart/mixed"'])
     if not criteria:
         criteria = ["ALL"]
     return criteria
+
+
+def _tokenize_bodystructure(data: str) -> list[str]:
+    """Tokenize an IMAP BODYSTRUCTURE S-expression string into a flat token list.
+
+    Splits on parentheses, quoted strings, NIL, atoms and numbers using
+    a positional state machine (no regex).
+
+    Args:
+        data: Raw BODYSTRUCTURE string, e.g. ``'(("text" "plain" ...) ...)'``.
+
+    Returns:
+        Flat list of tokens where ``(`` and ``)`` are individual tokens,
+        quoted strings have their quotes stripped, and atoms are kept as-is.
+    """
+    tokens: list[str] = []
+    i = 0
+    n = len(data)
+    while i < n:
+        c = data[i]
+        if c in " \t\r\n":
+            i += 1
+        elif c in "()":
+            tokens.append(c)
+            i += 1
+        elif c == '"':
+            i += 1
+            start = i
+            while i < n and data[i] != '"':
+                if data[i] == "\\" and i + 1 < n:
+                    i += 1
+                i += 1
+            tokens.append(data[start:i])
+            if i < n:
+                i += 1  # skip closing quote
+        else:
+            start = i
+            while i < n and data[i] not in ' \t\r\n()"':
+                i += 1
+            tokens.append(data[start:i])
+    return tokens
+
+
+def _parse_bodystructure_tokens(tokens: list[str]) -> list[Any]:
+    """Parse a flat token list into a nested list representing the BODYSTRUCTURE tree.
+
+    Uses a stack to handle the S-expression structure produced by
+    ``_tokenize_bodystructure``.
+
+    Args:
+        tokens: Flat token list from ``_tokenize_bodystructure``.
+
+    Returns:
+        Nested ``list[Any]`` corresponding to the outermost BODYSTRUCTURE level.
+        Returns an empty list if the token list is empty or malformed.
+    """
+    stack: list[list[Any]] = [[]]
+    for token in tokens:
+        if token == "(":
+            new_list: list[Any] = []
+            stack[-1].append(new_list)
+            stack.append(new_list)
+        elif token == ")":
+            if len(stack) > 1:
+                stack.pop()
+        else:
+            stack[-1].append(token)
+    root = stack[0]
+    return cast(list[Any], root[0]) if root else []
+
+
+def _extract_attachments_from_bodystructure(parsed: list[Any]) -> list[Attachment]:
+    """Recursively extract attachment metadata from a parsed BODYSTRUCTURE tree.
+
+    Handles multipart messages (nested parts) and single-part messages.
+    Identifies attachments by Content-Disposition and/or filename presence.
+
+    Args:
+        parsed: Nested list from ``_parse_bodystructure_tokens``.
+
+    Returns:
+        List of Attachment models extracted from the structure.
+    """
+    if not parsed:
+        return []
+
+    # Multipart: first element is a list (a nested body part)
+    if isinstance(parsed[0], list):
+        result: list[Attachment] = []
+        for item in parsed:
+            if isinstance(item, list):
+                result.extend(_extract_attachments_from_bodystructure(item))
+        return result
+
+    # Single part: first element is the main type string
+    if not isinstance(parsed[0], str):
+        return []
+
+    type_ = parsed[0].lower()
+    subtype = parsed[1].lower() if len(parsed) > 1 and isinstance(parsed[1], str) else ""
+    content_type = f"{type_}/{subtype}"
+
+    # Body params at index 2 (list of key-value pairs, or "NIL")
+    body_params: list[Any] = parsed[2] if len(parsed) > 2 and isinstance(parsed[2], list) else []
+
+    # Size at index 6 (encoded size in octets as reported by the server)
+    size_str = parsed[6] if len(parsed) > 6 and isinstance(parsed[6], str) else "NIL"
+
+    # Disposition index: text/* has an extra "lines" field at [7], shifting disposition to [9]
+    disp_idx = 9 if type_ == "text" else 8
+    disposition = parsed[disp_idx] if len(parsed) > disp_idx else "NIL"
+
+    # Parse disposition type and filename from disposition extension field
+    disp_type: str | None = None
+    disp_filename: str | None = None
+    if isinstance(disposition, list) and disposition:
+        if isinstance(disposition[0], str):
+            disp_type = disposition[0].lower()
+        raw_disp_params = disposition[1] if len(disposition) > 1 else "NIL"
+        disp_list: list[Any] = raw_disp_params if isinstance(raw_disp_params, list) else []
+        for i in range(0, len(disp_list) - 1, 2):
+            k, v = disp_list[i], disp_list[i + 1]
+            if isinstance(k, str) and k.lower() == "filename" and isinstance(v, str):
+                disp_filename = v
+                break
+
+    # Fallback: look for "name" in body params
+    body_filename: str | None = None
+    for i in range(0, len(body_params) - 1, 2):
+        k, v = body_params[i], body_params[i + 1]
+        if isinstance(k, str) and k.lower() == "name" and isinstance(v, str):
+            body_filename = v
+            break
+
+    filename = disp_filename or body_filename
+
+    # Determine whether this part qualifies as an attachment
+    is_attachment = False
+    if disp_type == "attachment":
+        is_attachment = True
+        if filename is None:
+            filename = "unnamed"
+    elif filename and content_type not in ("text/plain", "text/html"):
+        is_attachment = True
+
+    if not is_attachment or filename is None:
+        return []
+
+    size: int | None = None
+    try:
+        size = int(size_str)
+    except (ValueError, TypeError):
+        pass
+
+    return [Attachment(filename=_decode_header(filename), content_type=content_type, size=size)]
+
+
+def _extract_bodystructure_data(lines: list[bytes | bytearray]) -> str:
+    """Extract the BODYSTRUCTURE parenthesized string from a FETCH response.
+
+    Scans response lines for ``BODYSTRUCTURE (`` and extracts the balanced
+    parenthesized substring using a depth counter.
+
+    Args:
+        lines: Raw response lines from a UID FETCH (BODYSTRUCTURE) command.
+
+    Returns:
+        The balanced parenthesized BODYSTRUCTURE string (e.g. ``"((...) ...)"``).
+
+    Raises:
+        IMAPConnectionError: If no BODYSTRUCTURE is found in the response lines.
+    """
+    for line in lines:
+        if not isinstance(line, bytes):
+            continue
+        m = _BODYSTRUCTURE_RE.search(line)
+        if m is None:
+            continue
+        start = m.end() - 1  # position of the opening '('
+        data_bytes = line[start:]
+        depth = 0
+        end = 0
+        for i, ch in enumerate(data_bytes):
+            if ch == ord("("):
+                depth += 1
+            elif ch == ord(")"):
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+        if end > 0:
+            return data_bytes[:end].decode("ascii", errors="replace")
+    raise IMAPConnectionError("Resposta BODYSTRUCTURE não encontrada na resposta FETCH.")
+
+
+def _build_draft_message(
+    sender: str,
+    to: list[str],
+    subject: str,
+    body: str,
+    cc: list[str] | None = None,
+) -> bytes:
+    """Construct an RFC 822 email message suitable for IMAP APPEND.
+
+    Args:
+        sender: The From address.
+        to: List of To recipient addresses.
+        subject: Email subject line.
+        body: Plain-text email body.
+        cc: Optional list of CC recipient addresses.
+
+    Returns:
+        The email serialised as bytes.
+    """
+    msg = email.message.EmailMessage()
+    msg["From"] = sender
+    msg["To"] = ", ".join(to)
+    msg["Subject"] = subject
+    if cc:
+        msg["Cc"] = ", ".join(cc)
+    msg.set_content(body)
+    return msg.as_bytes()
 
 
 class IMAPConnectionPool:
@@ -345,6 +678,12 @@ class IMAPConnectionPool:
             raise IMAPConnectionError("Timeout ao conectar ao servidor IMAP.") from exc
         except aioimaplib.AioImapException as exc:
             raise IMAPConnectionError(f"Erro IMAP ao conectar: {exc}") from exc
+        except OSError as exc:
+            raise IMAPConnectionError(f"Erro de rede ao conectar ao servidor IMAP: {exc}") from exc
+        except Exception as exc:
+            raise IMAPConnectionError(
+                f"Erro inesperado ao conectar ao servidor IMAP: {exc}"
+            ) from exc
 
     async def _health_check(self, conn: IMAP4_SSL) -> bool:
         """Check if a connection is still alive via NOOP.
@@ -411,7 +750,14 @@ class IMAPConnectionPool:
         Raises:
             IMAPConnectionError: If a healthy connection cannot be obtained or replaced.
         """
-        conn = await self._queue.get()
+        try:
+            conn = await asyncio.wait_for(
+                self._queue.get(), timeout=float(self._settings.imap_timeout)
+            )
+        except TimeoutError as exc:
+            raise IMAPConnectionError(
+                "Timeout ao aguardar conexão disponível no pool IMAP."
+            ) from exc
         try:
             if not await self._health_check(conn):
                 log.info("Conexão IMAP obsoleta — reconectando.")
@@ -430,7 +776,10 @@ class IMAPConnectionPool:
                 replacement = await self._retry_operation(self._create_connection)
                 await self._queue.put(replacement)
             except Exception:
-                log.error("Falha ao substituir conexão IMAP após erro.")
+                log.error(
+                    "Falha ao substituir conexão IMAP após erro. "
+                    "O pool encolheu — conexões disponíveis reduzidas."
+                )
             raise
         else:
             await self._queue.put(conn)
@@ -447,6 +796,11 @@ class IMAPConnectionPool:
         for _ in range(self._settings.imap_pool_size):
             conn = await self._retry_operation(self._create_connection)
             await self._queue.put(conn)
+
+    @property
+    def email(self) -> str:
+        """Return the configured iCloud email address."""
+        return self._settings.icloud_email
 
     async def close(self) -> None:
         """Gracefully logout and close all connections in the pool."""
@@ -489,7 +843,7 @@ class IMAPClient:
             IMAPConnectionError: If the LIST command fails.
         """
         async with self._pool.acquire() as conn:
-            response = await conn.list("", "*")
+            response = await conn.list('""', "*")
         if response.result != "OK":
             raise IMAPConnectionError("Falha ao listar pastas IMAP.")
         return [
@@ -499,16 +853,20 @@ class IMAPClient:
             if (f := _parse_list_line(line)) is not None
         ]
 
-    async def list_emails(self, folder: str, limit: int = 20, offset: int = 0) -> list[Email]:
-        """List emails in a folder with offset-based pagination (newest first).
+    async def list_emails(
+        self, folder: str, limit: int = 20, offset: int = 0, sort_order: str = "desc"
+    ) -> EmailListResult:
+        """List emails in a folder with offset-based pagination.
 
         Args:
             folder: Folder name (e.g. ``"INBOX"``).
             limit: Maximum number of emails to return.
-            offset: Number of emails to skip, counted from the newest.
+            offset: Number of emails to skip, counted from the first position.
+            sort_order: ``"desc"`` (default, newest first) or ``"asc"`` (oldest first).
 
         Returns:
-            List of Email models (headers only), ordered newest-first.
+            EmailListResult with paginated emails and total_count reflecting the
+            full folder size regardless of limit/offset.
 
         Raises:
             IMAPConnectionError: If SELECT or FETCH operations fail.
@@ -523,21 +881,26 @@ class IMAPClient:
                 for p in line.decode().split()
                 if p.isdigit()
             ]
-            all_uids.reverse()  # UIDs are monotonically increasing; highest UID = newest
+            if sort_order == "desc":
+                all_uids.reverse()  # UIDs are monotonically increasing; highest UID = newest
+            total_count = len(all_uids)
             page_uids = all_uids[offset : offset + limit]
             if not page_uids:
-                return []
+                return EmailListResult(emails=[], total_count=total_count)
             uid_set = ",".join(page_uids)
             fetch_resp = await conn.uid(
                 "FETCH",
                 uid_set,
-                "(FLAGS BODY.PEEK[HEADER.FIELDS (FROM TO CC SUBJECT DATE)])",
+                _HEADER_FIELDS,
             )
         parsed = _parse_fetch_response(fetch_resp.lines)
-        return [
+        emails = [
             _parse_email(hdr_bytes, uid, folder, headers_only=True, flags=flags)
-            for uid, (flags, hdr_bytes) in parsed.items()
+            for uid in page_uids
+            if uid in parsed
+            for flags, hdr_bytes in [parsed[uid]]
         ]
+        return EmailListResult(emails=emails, total_count=total_count)
 
     async def get_email(self, folder: str, uid: str) -> Email:
         """Fetch a complete email by UID including body and attachment metadata.
@@ -552,6 +915,7 @@ class IMAPClient:
         Raises:
             IMAPConnectionError: If the email is not found or the FETCH fails.
         """
+        _validate_uid(uid)
         async with self._pool.acquire() as conn:
             await conn.select(aioimaplib.quoted(folder))
             response = await conn.uid("FETCH", uid, "(FLAGS BODY.PEEK[])")
@@ -594,12 +958,14 @@ class IMAPClient:
             fetch_resp = await conn.uid(
                 "FETCH",
                 uid_set,
-                "(FLAGS BODY.PEEK[HEADER.FIELDS (FROM TO CC SUBJECT DATE)])",
+                _HEADER_FIELDS,
             )
         parsed = _parse_fetch_response(fetch_resp.lines)
         return [
             _parse_email(hdr_bytes, uid, query.folder, headers_only=True, flags=flags)
-            for uid, (flags, hdr_bytes) in parsed.items()
+            for uid in page_uids
+            if uid in parsed
+            for flags, hdr_bytes in [parsed[uid]]
         ]
 
     async def move_email(self, folder: str, uid: str, destination: str) -> dict[str, str]:
@@ -616,6 +982,7 @@ class IMAPClient:
         Raises:
             IMAPConnectionError: If the COPY or delete operation fails.
         """
+        _validate_uid(uid)
         async with self._pool.acquire() as conn:
             await conn.select(aioimaplib.quoted(folder))
             copy_resp = await conn.uid("COPY", uid, aioimaplib.quoted(destination))
@@ -642,6 +1009,168 @@ class IMAPClient:
         """
         return await self.move_email(folder, uid, ICLOUD_TRASH_FOLDER)
 
+    async def mark_as_read(self, folder: str, uid: str) -> dict[str, str]:
+        """Mark an email as read by adding the ``\\Seen`` flag.
+
+        Args:
+            folder: Folder containing the email.
+            uid: IMAP UID of the message.
+
+        Returns:
+            Dict with ``status`` and ``uid`` keys.
+
+        Raises:
+            IMAPConnectionError: If the STORE command fails.
+        """
+        _validate_uid(uid)
+        async with self._pool.acquire() as conn:
+            await conn.select(aioimaplib.quoted(folder))
+            response = await conn.uid("STORE", uid, "+FLAGS.SILENT", "(\\Seen)")
+            if response.result != "OK":
+                raise IMAPConnectionError(f"Falha ao marcar email {uid} como lido.")
+        return {"status": "marked_as_read", "uid": uid}
+
+    async def mark_as_unread(self, folder: str, uid: str) -> dict[str, str]:
+        """Mark an email as unread by removing the ``\\Seen`` flag.
+
+        Args:
+            folder: Folder containing the email.
+            uid: IMAP UID of the message.
+
+        Returns:
+            Dict with ``status`` and ``uid`` keys.
+
+        Raises:
+            IMAPConnectionError: If the STORE command fails.
+        """
+        _validate_uid(uid)
+        async with self._pool.acquire() as conn:
+            await conn.select(aioimaplib.quoted(folder))
+            response = await conn.uid("STORE", uid, "-FLAGS.SILENT", "(\\Seen)")
+            if response.result != "OK":
+                raise IMAPConnectionError(f"Falha ao marcar email {uid} como não lido.")
+        return {"status": "marked_as_unread", "uid": uid}
+
+    async def flag_email(self, folder: str, uid: str) -> dict[str, str]:
+        """Flag an email by adding the ``\\Flagged`` flag (star).
+
+        Args:
+            folder: Folder containing the email.
+            uid: IMAP UID of the message.
+
+        Returns:
+            Dict with ``status`` and ``uid`` keys.
+
+        Raises:
+            IMAPConnectionError: If the STORE command fails.
+        """
+        _validate_uid(uid)
+        async with self._pool.acquire() as conn:
+            await conn.select(aioimaplib.quoted(folder))
+            response = await conn.uid("STORE", uid, "+FLAGS.SILENT", "(\\Flagged)")
+            if response.result != "OK":
+                raise IMAPConnectionError(f"Falha ao adicionar flag ao email {uid}.")
+        return {"status": "flagged", "uid": uid}
+
+    async def unflag_email(self, folder: str, uid: str) -> dict[str, str]:
+        """Unflag an email by removing the ``\\Flagged`` flag (star).
+
+        Args:
+            folder: Folder containing the email.
+            uid: IMAP UID of the message.
+
+        Returns:
+            Dict with ``status`` and ``uid`` keys.
+
+        Raises:
+            IMAPConnectionError: If the STORE command fails.
+        """
+        _validate_uid(uid)
+        async with self._pool.acquire() as conn:
+            await conn.select(aioimaplib.quoted(folder))
+            response = await conn.uid("STORE", uid, "-FLAGS.SILENT", "(\\Flagged)")
+            if response.result != "OK":
+                raise IMAPConnectionError(f"Falha ao remover flag do email {uid}.")
+        return {"status": "unflagged", "uid": uid}
+
+    async def bulk_action(
+        self,
+        folder: str,
+        uids: list[str],
+        action: str,
+        destination: str | None = None,
+    ) -> dict[str, Any]:
+        """Apply an action to multiple emails by UID in a single IMAP operation.
+
+        Uses native IMAP UID sets (e.g. ``"42,43,44"``) to operate on all
+        specified messages in one server round-trip.
+
+        Args:
+            folder: Folder containing the emails.
+            uids: List of IMAP UIDs to act on.
+            action: One of ``mark_as_read``, ``mark_as_unread``, ``flag``,
+                ``unflag``, ``move``, or ``delete``.
+            destination: Target folder name — required only for ``move``.
+
+        Returns:
+            Dict with ``status`` and ``uids`` keys (plus ``destination`` for
+            ``move``/``delete`` actions).
+
+        Raises:
+            ValueError: If ``uids`` is non-empty but ``action`` is invalid,
+                or if ``action="move"`` is used without ``destination``.
+            IMAPConnectionError: If any IMAP command fails.
+        """
+        if not uids:
+            return {"status": "no_action", "uids": []}
+
+        for u in uids:
+            _validate_uid(u)
+
+        valid_actions = set(_BULK_STORE_ACTIONS) | {"move", "delete"}
+        if action not in valid_actions:
+            raise ValueError(
+                f"Ação inválida: {action}. Ações válidas: {', '.join(sorted(valid_actions))}"
+            )
+
+        uid_set = ",".join(uids)
+
+        async with self._pool.acquire() as conn:
+            await conn.select(aioimaplib.quoted(folder))
+
+            if action in _BULK_STORE_ACTIONS:
+                flag_op, flag_value = _BULK_STORE_ACTIONS[action]
+                response = await conn.uid("STORE", uid_set, flag_op, flag_value)
+                if response.result != "OK":
+                    raise IMAPConnectionError(
+                        f"Falha ao executar bulk {action} nos emails {uid_set}."
+                    )
+                return {"status": f"bulk_{action}", "uids": uids}
+
+            if action == "move":
+                if destination is None:
+                    raise ValueError("O parâmetro 'destination' é obrigatório para a ação 'move'.")
+                copy_resp = await conn.uid("COPY", uid_set, aioimaplib.quoted(destination))
+                if copy_resp.result != "OK":
+                    raise IMAPConnectionError(
+                        f"Falha ao copiar emails {uid_set} para '{destination}'."
+                    )
+                store_resp = await conn.uid("STORE", uid_set, "+FLAGS.SILENT", "(\\Deleted)")
+                if store_resp.result != "OK":
+                    raise IMAPConnectionError(f"Falha ao marcar emails {uid_set} como deletados.")
+                await conn.expunge()
+                return {"status": "bulk_moved", "uids": uids, "destination": destination}
+
+            # action == "delete"
+            copy_resp = await conn.uid("COPY", uid_set, aioimaplib.quoted(ICLOUD_TRASH_FOLDER))
+            if copy_resp.result != "OK":
+                raise IMAPConnectionError(f"Falha ao mover emails {uid_set} para a lixeira.")
+            store_resp = await conn.uid("STORE", uid_set, "+FLAGS.SILENT", "(\\Deleted)")
+            if store_resp.result != "OK":
+                raise IMAPConnectionError(f"Falha ao marcar emails {uid_set} como deletados.")
+            await conn.expunge()
+            return {"status": "bulk_deleted", "uids": uids, "destination": ICLOUD_TRASH_FOLDER}
+
     async def create_folder(self, name: str) -> Folder:
         """Create a new IMAP mailbox folder.
 
@@ -655,7 +1184,179 @@ class IMAPClient:
             IMAPConnectionError: If the CREATE command fails.
         """
         async with self._pool.acquire() as conn:
-            response = await conn.create(name)
+            response = await conn.create(aioimaplib.quoted(name))
         if response.result != "OK":
             raise IMAPConnectionError(f"Falha ao criar a pasta '{name}'.")
         return Folder(name=name)
+
+    async def rename_folder(self, old_name: str, new_name: str) -> Folder:
+        """Rename an existing IMAP mailbox folder.
+
+        Args:
+            old_name: Current folder name.
+            new_name: Desired new folder name.
+
+        Returns:
+            Folder model with the new name.
+
+        Raises:
+            IMAPConnectionError: If the RENAME command fails (e.g. folder does not exist).
+        """
+        async with self._pool.acquire() as conn:
+            response = await conn.rename(aioimaplib.quoted(old_name), aioimaplib.quoted(new_name))
+        if response.result != "OK":
+            raise IMAPConnectionError(f"Falha ao renomear a pasta '{old_name}' para '{new_name}'.")
+        return Folder(name=new_name)
+
+    async def delete_folder(self, name: str) -> dict[str, str]:
+        """Delete an empty IMAP mailbox folder.
+
+        Verifies that the folder is empty before issuing the DELETE command.
+        Refuses to delete folders that still contain messages.
+
+        Args:
+            name: Name of the folder to delete.
+
+        Returns:
+            Dict with ``{"status": "deleted", "name": name}``.
+
+        Raises:
+            IMAPConnectionError: If the folder does not exist, contains messages,
+                or the DELETE command fails.
+        """
+        async with self._pool.acquire() as conn:
+            status_resp = await conn.status(aioimaplib.quoted(name), "(MESSAGES)")
+            if status_resp.result != "OK":
+                raise IMAPConnectionError(f"Falha ao verificar a pasta '{name}'.")
+            status_line = b""
+            for line in status_resp.lines:
+                if isinstance(line, (bytes, bytearray)):
+                    status_line = bytes(line)
+                    break
+            match = re.search(rb"MESSAGES\s+(\d+)", status_line)
+            count = int(match.group(1)) if match else 0
+            if count > 0:
+                raise IMAPConnectionError(
+                    f"A pasta '{name}' contém mensagens e não pode ser removida."
+                )
+            delete_resp = await conn.delete(aioimaplib.quoted(name))
+        if delete_resp.result != "OK":
+            raise IMAPConnectionError(f"Falha ao remover a pasta '{name}'.")
+        return {"status": "deleted", "name": name}
+
+    async def list_attachments(self, folder: str, uid: str) -> list[Attachment]:
+        """List attachment metadata for an email without downloading the full message.
+
+        Uses IMAP FETCH BODYSTRUCTURE for efficient metadata retrieval — avoids
+        fetching the message body.
+
+        Args:
+            folder: Folder containing the email.
+            uid: IMAP UID of the message.
+
+        Returns:
+            List of Attachment models with filename, content_type, and size.
+
+        Raises:
+            IMAPConnectionError: If the BODYSTRUCTURE response cannot be parsed.
+        """
+        _validate_uid(uid)
+        async with self._pool.acquire() as conn:
+            await conn.select(aioimaplib.quoted(folder))
+            response = await conn.uid("FETCH", uid, "(BODYSTRUCTURE)")
+        bodystructure_str = _extract_bodystructure_data(response.lines)
+        tokens = _tokenize_bodystructure(bodystructure_str)
+        parsed = _parse_bodystructure_tokens(tokens)
+        return _extract_attachments_from_bodystructure(parsed)
+
+    async def download_attachment(self, folder: str, uid: str, filename: str) -> dict[str, str]:
+        """Download the binary content of a specific email attachment as base64.
+
+        Use ``get_email`` first to see available attachment filenames.
+
+        Args:
+            folder: Folder containing the email.
+            uid: IMAP UID of the message.
+            filename: The filename of the attachment to download.
+
+        Returns:
+            Dict with ``filename``, ``content_type``, and ``data`` (base64-encoded) keys.
+
+        Raises:
+            IMAPConnectionError: If the email or attachment is not found.
+        """
+        _validate_uid(uid)
+        async with self._pool.acquire() as conn:
+            await conn.select(aioimaplib.quoted(folder))
+            response = await conn.uid("FETCH", uid, "(FLAGS BODY.PEEK[])")
+        parsed = _parse_fetch_response(response.lines)
+        if uid not in parsed:
+            raise IMAPConnectionError(f"Email UID {uid} não encontrado em '{folder}'.")
+        _, raw_bytes = parsed[uid]
+        return _extract_attachment(raw_bytes, filename)
+
+    async def get_folder_stats(self, folder: str) -> FolderStats:
+        """Return message count and unread count for a folder via IMAP STATUS.
+
+        Args:
+            folder: Name of the folder to query.
+
+        Returns:
+            FolderStats with total_count and unread_count.
+
+        Raises:
+            IMAPConnectionError: If the STATUS command fails.
+        """
+        async with self._pool.acquire() as conn:
+            response = await conn.status(folder, "(MESSAGES UNSEEN)")
+        if response.result != "OK":
+            raise IMAPConnectionError(f"Falha ao obter estatísticas da pasta '{folder}'.")
+        status_line = b""
+        for line in response.lines:
+            if isinstance(line, (bytes, bytearray)):
+                status_line = bytes(line)
+                break
+        messages_match = re.search(rb"MESSAGES\s+(\d+)", status_line)
+        unseen_match = re.search(rb"UNSEEN\s+(\d+)", status_line)
+        total = int(messages_match.group(1)) if messages_match else 0
+        unread = int(unseen_match.group(1)) if unseen_match else 0
+        return FolderStats(folder=folder, total_count=total, unread_count=unread)
+
+    async def save_draft(
+        self,
+        to: list[str],
+        subject: str,
+        body: str,
+        cc: list[str] | None = None,
+    ) -> dict[str, str]:
+        """Save a draft email to the Drafts folder via IMAP APPEND.
+
+        Constructs an RFC 822 message from the given parameters and appends
+        it to the "Drafts" mailbox with the \\Draft flag set.
+
+        Args:
+            to: List of recipient email addresses.
+            subject: Email subject line.
+            body: Plain-text email body.
+            cc: Optional list of CC recipient addresses.
+
+        Returns:
+            Dict with status, folder name, and UID of the saved draft.
+
+        Raises:
+            IMAPConnectionError: If the APPEND operation fails.
+        """
+        sender = self._pool.email
+        message_bytes = _build_draft_message(sender, to, subject, body, cc)
+        async with self._pool.acquire() as conn:
+            response = await conn.append(message_bytes, mailbox="Drafts", flags="(\\Draft)")
+        if response.result != "OK":
+            raise IMAPConnectionError("Falha ao salvar rascunho na pasta 'Drafts'.")
+        uid = ""
+        for line in response.lines:
+            if isinstance(line, (bytes, bytearray)):
+                m = re.search(rb"APPENDUID\s+\d+\s+(\d+)", bytes(line))
+                if m:
+                    uid = m.group(1).decode()
+                    break
+        return {"status": "saved", "folder": "Drafts", "uid": uid}

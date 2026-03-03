@@ -1,44 +1,67 @@
 """Tests for server.py — MCP tool handlers and lifespan."""
 
 from datetime import date
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from icloud_mail_mcp.imap_client import IMAPClient
-from icloud_mail_mcp.models import Email, Folder
+from icloud_mail_mcp.models import Attachment, Email, EmailListResult, Folder, FolderStats
+from icloud_mail_mcp.rules import RulesEngine
 from icloud_mail_mcp.server import (
     AppContext,
     app_lifespan,
+    apply_rules,
+    bulk_action,
     create_folder,
+    create_rule,
     delete_email,
+    delete_folder,
+    delete_rule,
+    download_attachment,
+    flag_email,
+    forward_email,
     get_email,
+    get_folder_stats,
+    list_attachments,
     list_emails,
     list_folders,
+    list_rules,
+    mark_as_read,
+    mark_as_unread,
     mcp,
     move_email,
+    rename_folder,
+    reply_email,
+    save_draft,
     search_emails,
     send_email,
+    unflag_email,
 )
+
+MockCtx = tuple[MagicMock, AsyncMock, AsyncMock, RulesEngine]
 
 
 @pytest.fixture
-def mock_ctx() -> tuple[MagicMock, AsyncMock, AsyncMock]:
-    """MagicMock Context with AppContext carrying AsyncMock IMAP and SMTP clients."""
+def mock_ctx(tmp_path: Path) -> MockCtx:
+    """MagicMock Context with AppContext carrying AsyncMock IMAP/SMTP + RulesEngine."""
     imap_client = AsyncMock()
     smtp_client = AsyncMock()
+    rules_engine = RulesEngine(rules_dir=tmp_path)
     ctx = MagicMock()
     ctx.request_context.lifespan_context = AppContext(
         imap_client=imap_client,
         smtp_client=smtp_client,
+        rules_engine=rules_engine,
     )
-    return ctx, imap_client, smtp_client
+    return ctx, imap_client, smtp_client, rules_engine
 
 
-async def test_list_folders_tool(mock_ctx: tuple[MagicMock, AsyncMock, AsyncMock]) -> None:
+async def test_list_folders_tool(mock_ctx: MockCtx) -> None:
     """list_folders tool calls imap_client.list_folders and serializes Folder models."""
-    ctx, imap_client, _ = mock_ctx
+    ctx, imap_client, _, _ = mock_ctx
     imap_client.list_folders.return_value = [Folder(name="INBOX"), Folder(name="Sent")]
 
     result = await list_folders(ctx)
@@ -50,20 +73,43 @@ async def test_list_folders_tool(mock_ctx: tuple[MagicMock, AsyncMock, AsyncMock
     imap_client.list_folders.assert_called_once()
 
 
-async def test_list_emails_tool(mock_ctx: tuple[MagicMock, AsyncMock, AsyncMock]) -> None:
-    """list_emails tool delegates folder/limit/offset and serializes Email models."""
-    ctx, imap_client, _ = mock_ctx
-    imap_client.list_emails.return_value = [Email(uid="1", folder="INBOX")]
+async def test_list_emails_tool(mock_ctx: MockCtx) -> None:
+    """list_emails tool returns dict with 'emails' list and 'total_count'."""
+    ctx, imap_client, _, _ = mock_ctx
+    imap_client.list_emails.return_value = EmailListResult(
+        emails=[Email(uid="1", folder="INBOX")], total_count=1
+    )
 
     result = await list_emails(ctx, folder="INBOX", limit=10, offset=5)
 
-    assert len(result) == 1
-    imap_client.list_emails.assert_called_once_with(folder="INBOX", limit=10, offset=5)
+    assert result["total_count"] == 1
+    assert len(result["emails"]) == 1
+    imap_client.list_emails.assert_called_once_with(
+        folder="INBOX", limit=10, offset=5, sort_order="desc"
+    )
 
 
-async def test_get_email_tool(mock_ctx: tuple[MagicMock, AsyncMock, AsyncMock]) -> None:
+async def test_list_emails_tool_sort_order(
+    mock_ctx: MockCtx,
+) -> None:
+    """list_emails tool propagates sort_order='asc' to imap_client."""
+    ctx, imap_client, _, _ = mock_ctx
+    imap_client.list_emails.return_value = EmailListResult(
+        emails=[Email(uid="1", folder="INBOX")], total_count=1
+    )
+
+    result = await list_emails(ctx, folder="INBOX", limit=10, offset=0, sort_order="asc")
+
+    assert result["total_count"] == 1
+    assert len(result["emails"]) == 1
+    imap_client.list_emails.assert_called_once_with(
+        folder="INBOX", limit=10, offset=0, sort_order="asc"
+    )
+
+
+async def test_get_email_tool(mock_ctx: MockCtx) -> None:
     """get_email tool delegates folder/uid and serializes the Email model."""
-    ctx, imap_client, _ = mock_ctx
+    ctx, imap_client, _, _ = mock_ctx
     imap_client.get_email.return_value = Email(uid="42", folder="INBOX", subject="Hello")
 
     result = await get_email(ctx, folder="INBOX", uid="42")
@@ -73,9 +119,9 @@ async def test_get_email_tool(mock_ctx: tuple[MagicMock, AsyncMock, AsyncMock]) 
     imap_client.get_email.assert_called_once_with(folder="INBOX", uid="42")
 
 
-async def test_search_emails_tool(mock_ctx: tuple[MagicMock, AsyncMock, AsyncMock]) -> None:
+async def test_search_emails_tool(mock_ctx: MockCtx) -> None:
     """search_emails tool parses ISO date strings into date objects for SearchQuery."""
-    ctx, imap_client, _ = mock_ctx
+    ctx, imap_client, _, _ = mock_ctx
     imap_client.search_emails.return_value = []
 
     await search_emails(ctx, folder="INBOX", since="2024-01-01", before="2024-12-31", limit=5)
@@ -88,9 +134,33 @@ async def test_search_emails_tool(mock_ctx: tuple[MagicMock, AsyncMock, AsyncMoc
     assert query.limit == 5
 
 
-async def test_send_email_tool(mock_ctx: tuple[MagicMock, AsyncMock, AsyncMock]) -> None:
+async def test_search_emails_with_new_filters_tool(
+    mock_ctx: MockCtx,
+) -> None:
+    """search_emails tool propagates is_read, is_flagged, min_size, has_attachments."""
+    ctx, imap_client, _, _ = mock_ctx
+    imap_client.search_emails.return_value = []
+
+    await search_emails(
+        ctx,
+        folder="INBOX",
+        is_read=False,
+        is_flagged=True,
+        min_size=1024,
+        has_attachments=True,
+    )
+
+    call_kwargs = imap_client.search_emails.call_args.kwargs
+    query = call_kwargs["query"]
+    assert query.is_read is False
+    assert query.is_flagged is True
+    assert query.min_size == 1024
+    assert query.has_attachments is True
+
+
+async def test_send_email_tool(mock_ctx: MockCtx) -> None:
     """send_email tool delegates all arguments to smtp_client.send_email."""
-    ctx, _, smtp_client = mock_ctx
+    ctx, _, smtp_client, _ = mock_ctx
     smtp_client.send_email.return_value = {"status": "sent", "message_id": "abc"}
 
     result = await send_email(
@@ -112,9 +182,9 @@ async def test_send_email_tool(mock_ctx: tuple[MagicMock, AsyncMock, AsyncMock])
     )
 
 
-async def test_move_email_tool(mock_ctx: tuple[MagicMock, AsyncMock, AsyncMock]) -> None:
+async def test_move_email_tool(mock_ctx: MockCtx) -> None:
     """move_email tool delegates folder/uid/destination to imap_client."""
-    ctx, imap_client, _ = mock_ctx
+    ctx, imap_client, _, _ = mock_ctx
     imap_client.move_email.return_value = {
         "status": "moved",
         "uid": "42",
@@ -127,9 +197,9 @@ async def test_move_email_tool(mock_ctx: tuple[MagicMock, AsyncMock, AsyncMock])
     imap_client.move_email.assert_called_once_with(folder="INBOX", uid="42", destination="Archive")
 
 
-async def test_delete_email_tool(mock_ctx: tuple[MagicMock, AsyncMock, AsyncMock]) -> None:
+async def test_delete_email_tool(mock_ctx: MockCtx) -> None:
     """delete_email tool delegates folder/uid to imap_client."""
-    ctx, imap_client, _ = mock_ctx
+    ctx, imap_client, _, _ = mock_ctx
     imap_client.delete_email.return_value = {
         "status": "moved",
         "uid": "7",
@@ -142,15 +212,141 @@ async def test_delete_email_tool(mock_ctx: tuple[MagicMock, AsyncMock, AsyncMock
     imap_client.delete_email.assert_called_once_with(folder="INBOX", uid="7")
 
 
-async def test_create_folder_tool(mock_ctx: tuple[MagicMock, AsyncMock, AsyncMock]) -> None:
+async def test_create_folder_tool(mock_ctx: MockCtx) -> None:
     """create_folder tool delegates name and serializes the returned Folder."""
-    ctx, imap_client, _ = mock_ctx
+    ctx, imap_client, _, _ = mock_ctx
     imap_client.create_folder.return_value = Folder(name="MyFolder")
 
     result = await create_folder(ctx, name="MyFolder")
 
     assert result["name"] == "MyFolder"
     imap_client.create_folder.assert_called_once_with(name="MyFolder")
+
+
+async def test_rename_folder_tool(mock_ctx: MockCtx) -> None:
+    """rename_folder tool delegates old_name/new_name and serializes the returned Folder."""
+    ctx, imap_client, _, _ = mock_ctx
+    imap_client.rename_folder.return_value = Folder(name="NewName")
+
+    result = await rename_folder(ctx, old_name="OldName", new_name="NewName")
+
+    assert result["name"] == "NewName"
+    imap_client.rename_folder.assert_called_once_with(old_name="OldName", new_name="NewName")
+
+
+async def test_delete_folder_tool(mock_ctx: MockCtx) -> None:
+    """delete_folder tool delegates name to imap_client.delete_folder and returns result."""
+    ctx, imap_client, _, _ = mock_ctx
+    imap_client.delete_folder.return_value = {"status": "deleted", "name": "MyFolder"}
+
+    result = await delete_folder(ctx, name="MyFolder")
+
+    assert result == {"status": "deleted", "name": "MyFolder"}
+    imap_client.delete_folder.assert_called_once_with(name="MyFolder")
+
+
+async def test_get_folder_stats_tool(mock_ctx: MockCtx) -> None:
+    """get_folder_stats tool delegates to imap_client.get_folder_stats and serializes model."""
+    ctx, imap_client, _, _ = mock_ctx
+    imap_client.get_folder_stats.return_value = FolderStats(
+        folder="INBOX", total_count=42, unread_count=3
+    )
+
+    result = await get_folder_stats(ctx, folder="INBOX")
+
+    assert result == {"folder": "INBOX", "total_count": 42, "unread_count": 3}
+    imap_client.get_folder_stats.assert_called_once_with(folder="INBOX")
+
+
+async def test_mark_as_read_tool(mock_ctx: MockCtx) -> None:
+    """mark_as_read tool delegates folder/uid to imap_client.mark_as_read."""
+    ctx, imap_client, _, _ = mock_ctx
+    imap_client.mark_as_read.return_value = {"status": "marked_as_read", "uid": "42"}
+
+    result = await mark_as_read(ctx, folder="INBOX", uid="42")
+
+    assert result == {"status": "marked_as_read", "uid": "42"}
+    imap_client.mark_as_read.assert_called_once_with(folder="INBOX", uid="42")
+
+
+async def test_mark_as_unread_tool(mock_ctx: MockCtx) -> None:
+    """mark_as_unread tool delegates folder/uid to imap_client.mark_as_unread."""
+    ctx, imap_client, _, _ = mock_ctx
+    imap_client.mark_as_unread.return_value = {"status": "marked_as_unread", "uid": "42"}
+
+    result = await mark_as_unread(ctx, folder="INBOX", uid="42")
+
+    assert result == {"status": "marked_as_unread", "uid": "42"}
+    imap_client.mark_as_unread.assert_called_once_with(folder="INBOX", uid="42")
+
+
+async def test_flag_email_tool(mock_ctx: MockCtx) -> None:
+    """flag_email tool delegates folder/uid to imap_client.flag_email."""
+    ctx, imap_client, _, _ = mock_ctx
+    imap_client.flag_email.return_value = {"status": "flagged", "uid": "42"}
+
+    result = await flag_email(ctx, folder="INBOX", uid="42")
+
+    assert result == {"status": "flagged", "uid": "42"}
+    imap_client.flag_email.assert_called_once_with(folder="INBOX", uid="42")
+
+
+async def test_unflag_email_tool(mock_ctx: MockCtx) -> None:
+    """unflag_email tool delegates folder/uid to imap_client.unflag_email."""
+    ctx, imap_client, _, _ = mock_ctx
+    imap_client.unflag_email.return_value = {"status": "unflagged", "uid": "42"}
+
+    result = await unflag_email(ctx, folder="INBOX", uid="42")
+
+    assert result == {"status": "unflagged", "uid": "42"}
+    imap_client.unflag_email.assert_called_once_with(folder="INBOX", uid="42")
+
+
+async def test_bulk_action_tool(mock_ctx: MockCtx) -> None:
+    """bulk_action tool delegates all params to imap_client.bulk_action."""
+    ctx, imap_client, _, _ = mock_ctx
+    imap_client.bulk_action.return_value = {"status": "bulk_mark_as_read", "uids": ["42", "43"]}
+
+    result = await bulk_action(ctx, folder="INBOX", uids=["42", "43"], action="mark_as_read")
+
+    assert result == {"status": "bulk_mark_as_read", "uids": ["42", "43"]}
+    imap_client.bulk_action.assert_called_once_with(
+        folder="INBOX", uids=["42", "43"], action="mark_as_read", destination=None
+    )
+
+
+async def test_list_attachments_tool(mock_ctx: MockCtx) -> None:
+    """list_attachments tool delegates folder/uid to imap_client and serializes results."""
+    ctx, imap_client, _, _ = mock_ctx
+    imap_client.list_attachments.return_value = [
+        Attachment(filename="report.pdf", content_type="application/pdf", size=38000)
+    ]
+
+    result = await list_attachments(ctx, folder="INBOX", uid="42")
+
+    assert result == [{"filename": "report.pdf", "content_type": "application/pdf", "size": 38000}]
+    imap_client.list_attachments.assert_called_once_with(folder="INBOX", uid="42")
+
+
+async def test_download_attachment_tool(
+    mock_ctx: MockCtx,
+) -> None:
+    """download_attachment tool delegates folder/uid/filename to imap_client."""
+    ctx, imap_client, _, _ = mock_ctx
+    imap_client.download_attachment.return_value = {
+        "filename": "report.pdf",
+        "content_type": "application/pdf",
+        "data": "ZmFrZQ==",
+    }
+
+    result = await download_attachment(ctx, folder="INBOX", uid="42", filename="report.pdf")
+
+    assert result["filename"] == "report.pdf"
+    assert result["content_type"] == "application/pdf"
+    assert result["data"] == "ZmFrZQ=="
+    imap_client.download_attachment.assert_called_once_with(
+        folder="INBOX", uid="42", filename="report.pdf"
+    )
 
 
 async def test_lifespan_init_and_close() -> None:
@@ -160,12 +356,144 @@ async def test_lifespan_init_and_close() -> None:
     mock_pool = AsyncMock()
     mock_smtp_client: Any = MagicMock()
 
+    mock_rules: Any = MagicMock()
+
     with patch("icloud_mail_mcp.server.get_settings", return_value=mock_settings):
         with patch("icloud_mail_mcp.server.IMAPConnectionPool", return_value=mock_pool):
             with patch("icloud_mail_mcp.server.SMTPClient", return_value=mock_smtp_client):
-                async with app_lifespan(mcp) as ctx:
-                    mock_pool.initialize.assert_called_once()
-                    assert isinstance(ctx.imap_client, IMAPClient)
-                    assert ctx.smtp_client is mock_smtp_client
+                with patch("icloud_mail_mcp.server.RulesEngine", return_value=mock_rules):
+                    async with app_lifespan(mcp) as ctx:
+                        mock_pool.initialize.assert_called_once()
+                        assert isinstance(ctx.imap_client, IMAPClient)
+                        assert ctx.smtp_client is mock_smtp_client
+                        assert ctx.rules_engine is mock_rules
 
-                mock_pool.close.assert_called_once()
+                    mock_pool.close.assert_called_once()
+
+
+async def test_save_draft_tool(
+    mock_ctx: MockCtx,
+) -> None:
+    """save_draft tool delegates to imap_client.save_draft with correct kwargs."""
+    ctx, imap_client, _, _ = mock_ctx
+    imap_client.save_draft.return_value = {"status": "saved", "folder": "Drafts", "uid": "456"}
+
+    result = await save_draft(ctx, to=["to@example.com"], subject="Test", body="Body")
+
+    assert result == {"status": "saved", "folder": "Drafts", "uid": "456"}
+    imap_client.save_draft.assert_called_once_with(
+        to=["to@example.com"], subject="Test", body="Body", cc=None
+    )
+
+
+async def test_reply_email_tool(mock_ctx: MockCtx) -> None:
+    """reply_email tool fetches the original via imap_client and delegates to smtp_client."""
+    ctx, imap_client, smtp_client, _ = mock_ctx
+    original = Email(uid="10", folder="INBOX", subject="Hello", sender="alice@example.com")
+    imap_client.get_email.return_value = original
+    smtp_client.reply_email.return_value = {"status": "sent", "message_id": "<r@mail>"}
+
+    result = await reply_email(ctx, folder="INBOX", uid="10", body="My reply.")
+
+    assert result == {"status": "sent", "message_id": "<r@mail>"}
+    imap_client.get_email.assert_called_once_with(folder="INBOX", uid="10")
+    smtp_client.reply_email.assert_called_once_with(
+        original=original, body="My reply.", reply_all=False
+    )
+
+
+async def test_forward_email_tool(mock_ctx: MockCtx) -> None:
+    """forward_email tool fetches the original via imap_client and delegates to smtp_client."""
+    ctx, imap_client, smtp_client, _ = mock_ctx
+    original = Email(uid="10", folder="INBOX", subject="Hello", sender="alice@example.com")
+    imap_client.get_email.return_value = original
+    smtp_client.forward_email.return_value = {"status": "sent", "message_id": "<f@mail>"}
+
+    result = await forward_email(ctx, folder="INBOX", uid="10", to=["dave@example.com"])
+
+    assert result == {"status": "sent", "message_id": "<f@mail>"}
+    imap_client.get_email.assert_called_once_with(folder="INBOX", uid="10")
+    smtp_client.forward_email.assert_called_once_with(
+        original=original, to=["dave@example.com"], body=None
+    )
+
+
+async def test_list_rules_tool(mock_ctx: MockCtx) -> None:
+    """list_rules tool uses the shared RulesEngine from AppContext."""
+    ctx, _, _, _ = mock_ctx
+    result = await list_rules(ctx)
+    assert result == []
+
+
+async def test_create_rule_tool(mock_ctx: MockCtx) -> None:
+    """create_rule tool delegates name/conditions/actions to shared RulesEngine."""
+    ctx, _, _, _ = mock_ctx
+    result = await create_rule(
+        ctx,
+        name="test",
+        conditions=[{"field": "sender", "operator": "equals", "value": "x"}],
+        actions=[{"action_type": "mark_as_read"}],
+    )
+    assert result["name"] == "test"
+
+
+async def test_delete_rule_tool(mock_ctx: MockCtx) -> None:
+    """delete_rule tool delegates name to shared RulesEngine.delete_rule."""
+    ctx, _, _, _ = mock_ctx
+    # First create a rule, then delete it
+    await create_rule(
+        ctx,
+        name="old",
+        conditions=[{"field": "sender", "operator": "equals", "value": "x"}],
+        actions=[{"action_type": "mark_as_read"}],
+    )
+    result = await delete_rule(ctx, name="old")
+    assert result == {"status": "deleted", "name": "old"}
+
+
+async def test_apply_rules_tool(mock_ctx: MockCtx) -> None:
+    """apply_rules tool delegates folder and imap_client to shared RulesEngine."""
+    ctx, imap_client, _, _ = mock_ctx
+    imap_client.list_emails.return_value = EmailListResult(emails=[], total_count=0)
+
+    result = await apply_rules(ctx, folder="INBOX")
+
+    assert result == {"processed": 0, "matched": 0, "actions_applied": 0}
+
+
+async def test_rules_tool_uses_shared_engine(
+    mock_ctx: MockCtx,
+) -> None:
+    """All rule tools use the same RulesEngine instance from AppContext."""
+    ctx, _, _, rules_engine = mock_ctx
+    # Create via tool
+    await create_rule(
+        ctx,
+        name="shared",
+        conditions=[{"field": "sender", "operator": "equals", "value": "x"}],
+        actions=[{"action_type": "mark_as_read"}],
+    )
+    # Verify via direct access — same engine
+    assert len(rules_engine.list_rules()) == 1
+    # List via tool — should see the same rule
+    result = await list_rules(ctx)
+    assert len(result) == 1
+    assert result[0]["name"] == "shared"
+
+
+async def test_search_emails_invalid_since_date(
+    mock_ctx: MockCtx,
+) -> None:
+    """search_emails raises ValueError for invalid 'since' date format."""
+    ctx, _, _, _ = mock_ctx
+    with pytest.raises(ValueError, match="Formato de data inválido para 'since'"):
+        await search_emails(ctx, since="not-a-date")
+
+
+async def test_search_emails_invalid_before_date(
+    mock_ctx: MockCtx,
+) -> None:
+    """search_emails raises ValueError for invalid 'before' date format."""
+    ctx, _, _, _ = mock_ctx
+    with pytest.raises(ValueError, match="Formato de data inválido para 'before'"):
+        await search_emails(ctx, before="31/12/2024")
