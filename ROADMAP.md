@@ -532,3 +532,51 @@ Phase 21 (rules/filters)           ← depende de todas as acoes anteriores (apl
 - `pyproject.toml` — deps `httpx` + `icalendar`; override mypy tratando `icalendar` como modulo opaco.
 
 **Verificacao**: `uv run ruff check . && uv run ruff format --check . && uv run mypy src/ && uv run pytest -v`
+
+---
+
+## Phase 23: Recorrencia de eventos (serie inteira)
+
+**Objetivo**: Suporte a eventos recorrentes no Calendar. iCloud expoe a `RRULE` mas seu `expand` server-side e instavel — entao a expansao e feita **client-side**.
+
+**Resposta a "falha em ver ou em criar/editar?"**: a escrita (PUT de `VEVENT` com `RRULE`) funciona; o problema do iCloud e na **leitura/expansao** (`<C:expand>` erratico, time-range inconsistente). Alem disso, o codigo antigo descartava a `RRULE` no parse — mostrando o recorrente uma unica vez.
+
+**Decisoes-chave**:
+- **Expansao client-side** com `recurring-ical-events` (sobre `icalendar` + `python-dateutil`, ja no lock). Nunca usar o `expand` do iCloud.
+- **Deteccao de recorrencia vem do VCALENDAR mestre** (VEVENT com `RRULE`/`RDATE`), pois ocorrencias expandidas nao mantem `RRULE` e ate eventos simples recebem `RECURRENCE-ID` da lib.
+- **Escopo**: serie inteira. Editar/excluir ocorrencia unica (`RECURRENCE-ID`/`EXDATE`) fica para a Phase 24.
+
+**Arquivos modificados**:
+- `src/icloud_mcp/models.py` — `CalendarEvent` ganha `rrule`, `is_recurring`, `recurrence_id`.
+- `src/icloud_mcp/caldav_client.py` — `list_events` expande ocorrencias na janela; `get_event` preserva o mestre sem expandir; novos helpers `_recurrence_info`/`_master_component`/`_component_to_event`/`_parse_ics_master`/`_expand_ics`; `create_event`/`update_event` aceitam `rrule` (com `_build_rrule` validando antes do PUT; `rrule=""` no update remove a recorrencia).
+- `src/icloud_mcp/server.py` — tools `create_event`/`update_event` propagam `rrule`; docstrings de `list_events`/`update_event` atualizadas.
+- `tests/test_caldav_client.py` — expansao semanal, `EXDATE`, override `RECURRENCE-ID`, `get_event` preserva `RRULE`, nao-recorrente sem campos, create com `RRULE` valida/invalida, update remove/mantem recorrencia.
+- `tests/test_server.py` — handler `create_event` com `rrule`; asserts ajustados para o novo kwarg.
+- `pyproject.toml` — dep `recurring-ical-events`; override mypy para `recurring_ical_events`/`x_wr_timezone`.
+
+**Verificacao**: `uv run ruff check . && uv run ruff format --check . && uv run mypy src/ && uv run pytest -v` (209 passed)
+
+---
+
+## Phase 24: Editar/excluir uma unica ocorrencia
+
+**Objetivo**: Operar em uma ocorrencia isolada de uma serie recorrente, sem afetar as demais. Continuacao da Phase 23 (escopo "serie inteira").
+
+**Modelo CalDAV**: a serie e um unico recurso (.ics) = VEVENT mestre (com RRULE) + zero ou mais VEVENTs override (cada um com RECURRENCE-ID apontando o slot original). Operacoes nunca criam recurso novo — fazem PUT do recurso inteiro com If-Match.
+- **Editar 1 ocorrencia** → insere/atualiza um override com RECURRENCE-ID = slot original + campos novos.
+- **Excluir 1 ocorrencia** → adiciona EXDATE = slot original ao mestre (e remove o override daquele slot, se houver).
+
+**Decisoes-chave**:
+- **Tools dedicadas** `update_occurrence`/`delete_occurrence` (mais explicito que um parametro opcional; evita editar a serie inteira por engano).
+- A ocorrencia e endereçada por **`uid` + `recurrence_id`** (o slot original, ja retornado por `list_events` na Phase 23).
+- O **tipo** do RECURRENCE-ID/EXDATE (date vs datetime) e derivado do DTSTART do mestre (all-day → VALUE=DATE).
+- **Validacao** antes de escrever: serie e recorrente? slot existe (expansao de janela estreita)? Senao, erro claro.
+- **Fora de escopo**: "esta e futuras" (THISANDFUTURE).
+
+**Arquivos modificados**:
+- `src/icloud_mcp/caldav_client.py` — `_fetch_resource` (REPORT por UID → VCALENDAR bruto + href + etag); metodos `update_occurrence` (upsert override) e `delete_occurrence` (EXDATE + remove override); helper `_put_resource`; helpers puros `_require_recurring_master`/`_recurrence_id_value`/`_find_override`/`_slot_in_series`/`_new_override`/`_apply_occurrence_fields`/`_as_dt`/`_same_moment`/`_master_duration`/`_set_prop`; `_uid_query_body` extraido (DRY com `_find_event`).
+- `src/icloud_mcp/server.py` — tools `update_occurrence`/`delete_occurrence` (parse ISO do recurrence_id).
+- `tests/test_caldav_client.py` — adicionar override, upsert override existente, EXDATE, EXDATE removendo override, all-day VALUE=DATE, erro nao-recorrente, erro slot inexistente.
+- `tests/test_server.py` — handlers `update_occurrence`/`delete_occurrence`.
+
+**Verificacao**: `uv run ruff check . && uv run ruff format --check . && uv run mypy src/ && uv run pytest -v` (218 passed; 33 tools)

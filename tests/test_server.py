@@ -29,6 +29,7 @@ from icloud_mcp.server import (
     delete_email,
     delete_event,
     delete_folder,
+    delete_occurrence,
     delete_rule,
     download_attachment,
     flag_email,
@@ -53,6 +54,7 @@ from icloud_mcp.server import (
     send_email,
     unflag_email,
     update_event,
+    update_occurrence,
 )
 
 MockCtx = tuple[MagicMock, AsyncMock, AsyncMock, RulesEngine]
@@ -629,7 +631,35 @@ async def test_create_event_tool(mock_ctx: MockCtx) -> None:
         all_day=False,
         location="Cafe",
         description=None,
+        rrule=None,
     )
+
+
+async def test_create_event_tool_forwards_rrule(mock_ctx: MockCtx) -> None:
+    """create_event forwards the rrule argument to the client."""
+    ctx, *_ = mock_ctx
+    caldav = _caldav(ctx)
+    caldav.create_event.return_value = CalendarEvent(
+        uid="rec",
+        calendar="Work",
+        summary="Standup",
+        start=datetime(2026, 6, 1, 9, tzinfo=UTC),
+        end=datetime(2026, 6, 1, 9, 30, tzinfo=UTC),
+        rrule="FREQ=WEEKLY;BYDAY=MO",
+        is_recurring=True,
+    )
+
+    result = await create_event(
+        ctx,
+        calendar="Work",
+        summary="Standup",
+        start="2026-06-01T09:00:00",
+        end="2026-06-01T09:30:00",
+        rrule="FREQ=WEEKLY;BYDAY=MO",
+    )
+
+    assert result["is_recurring"] is True
+    assert caldav.create_event.call_args.kwargs["rrule"] == "FREQ=WEEKLY;BYDAY=MO"
 
 
 async def test_update_event_tool_partial(mock_ctx: MockCtx) -> None:
@@ -656,6 +686,7 @@ async def test_update_event_tool_partial(mock_ctx: MockCtx) -> None:
         all_day=None,
         location=None,
         description=None,
+        rrule=None,
     )
 
 
@@ -669,3 +700,61 @@ async def test_delete_event_tool(mock_ctx: MockCtx) -> None:
 
     assert result == {"status": "deleted", "uid": "e1"}
     caldav.delete_event.assert_called_once_with(calendar="Work", uid="e1")
+
+
+async def test_update_occurrence_tool(mock_ctx: MockCtx) -> None:
+    """update_occurrence parses recurrence_id/dates and forwards them."""
+    ctx, *_ = mock_ctx
+    caldav = _caldav(ctx)
+    caldav.update_occurrence.return_value = CalendarEvent(
+        uid="weekly-1",
+        calendar="Work",
+        summary="Moved",
+        start=datetime(2026, 6, 15, 11, tzinfo=UTC),
+        end=datetime(2026, 6, 15, 11, 30, tzinfo=UTC),
+        is_recurring=True,
+        recurrence_id=datetime(2026, 6, 15, 9, tzinfo=UTC),
+    )
+
+    result = await update_occurrence(
+        ctx,
+        calendar="Work",
+        uid="weekly-1",
+        recurrence_id="2026-06-15T09:00:00",
+        summary="Moved",
+        start="2026-06-15T11:00:00",
+    )
+
+    assert result["summary"] == "Moved"
+    caldav.update_occurrence.assert_called_once_with(
+        calendar="Work",
+        uid="weekly-1",
+        recurrence_id=datetime(2026, 6, 15, 9),
+        summary="Moved",
+        start=datetime(2026, 6, 15, 11),
+        end=None,
+        location=None,
+        description=None,
+    )
+
+
+async def test_delete_occurrence_tool(mock_ctx: MockCtx) -> None:
+    """delete_occurrence parses recurrence_id and forwards it."""
+    ctx, *_ = mock_ctx
+    caldav = _caldav(ctx)
+    caldav.delete_occurrence.return_value = {
+        "status": "deleted_occurrence",
+        "uid": "weekly-1",
+        "recurrence_id": "2026-06-08T09:00:00",
+    }
+
+    result = await delete_occurrence(
+        ctx, calendar="Work", uid="weekly-1", recurrence_id="2026-06-08T09:00:00"
+    )
+
+    assert result["status"] == "deleted_occurrence"
+    caldav.delete_occurrence.assert_called_once_with(
+        calendar="Work",
+        uid="weekly-1",
+        recurrence_id=datetime(2026, 6, 8, 9),
+    )
