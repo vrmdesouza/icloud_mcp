@@ -1224,3 +1224,120 @@ async def test_delete_reminder_list_with_confirm() -> None:
     assert result == {"status": "deleted_list", "list": "Tasks"}
     assert captured["url"].endswith("/reminders/")
     await client.close()
+
+
+# -- reminders: Phase 2 (cross-list search) --------------------------------
+
+
+def _todo_response_at(slug: str, uid: str, ics: str, etag: str = "e") -> str:
+    return (
+        f"  <response>\n"
+        f"    <href>/123456/calendars/{slug}/{uid}.ics</href>\n"
+        f"    <propstat><prop>\n"
+        f'      <getetag>"{etag}"</getetag>\n'
+        f"      <c:calendar-data>{ics}</c:calendar-data>\n"
+        f"    </prop><status>HTTP/1.1 200 OK</status></propstat>\n"
+        f"  </response>\n"
+    )
+
+
+def _search_handler(request: httpx.Request) -> httpx.Response:
+    """Two lists with dated/undated/completed tasks for search tests."""
+    disc = _two_lists_discovery(request)
+    if disc is not None:
+        return disc
+    if request.method == "REPORT":
+        if "/reminders/" in request.url.path:  # 'Tasks'
+            return httpx.Response(
+                207,
+                content=_events_multistatus(
+                    _todo_response_at(
+                        "reminders",
+                        "t-today",
+                        _vtodo("t-today", "Today task", due="20260618T100000Z"),
+                    ),
+                    _todo_response_at(
+                        "reminders",
+                        "t-future",
+                        _vtodo("t-future", "Future task", due="20260625T090000Z"),
+                    ),
+                    _todo_response_at(
+                        "reminders",
+                        "t-done",
+                        _vtodo(
+                            "t-done", "Done task", status="COMPLETED", completed="20260601T120000Z"
+                        ),
+                    ),
+                ),
+            )
+        if "/personal/" in request.url.path:  # 'Personal'
+            return httpx.Response(
+                207,
+                content=_events_multistatus(
+                    _todo_response_at(
+                        "personal",
+                        "p-overdue",
+                        _vtodo("p-overdue", "Overdue task", due="20260610T090000Z"),
+                    ),
+                    _todo_response_at("personal", "p-someday", _vtodo("p-someday", "Someday plan")),
+                ),
+            )
+    return httpx.Response(500, text="unexpected")
+
+
+async def test_search_reminders_all_lists_default() -> None:
+    client = _make_client(_search_handler)
+    reminders = await client.search_reminders()
+    # Completed 't-done' hidden; sorted by due (undated last).
+    assert [r.uid for r in reminders] == ["p-overdue", "t-today", "t-future", "p-someday"]
+    assert {r.list for r in reminders} == {"Tasks", "Personal"}
+    await client.close()
+
+
+async def test_search_reminders_overdue_preset() -> None:
+    client = _make_client(_search_handler)
+    reminders = await client.search_reminders(
+        due_before=datetime(2026, 6, 18, tzinfo=UTC), undated=False
+    )
+    assert [r.uid for r in reminders] == ["p-overdue"]
+    await client.close()
+
+
+async def test_search_reminders_due_window() -> None:
+    client = _make_client(_search_handler)
+    reminders = await client.search_reminders(
+        due_after=datetime(2026, 6, 18, tzinfo=UTC),
+        due_before=datetime(2026, 6, 19, tzinfo=UTC),
+        undated=False,
+    )
+    assert [r.uid for r in reminders] == ["t-today"]
+    await client.close()
+
+
+async def test_search_reminders_query_matches_title() -> None:
+    client = _make_client(_search_handler)
+    reminders = await client.search_reminders(query="someday")
+    assert [r.uid for r in reminders] == ["p-someday"]
+    await client.close()
+
+
+async def test_search_reminders_include_completed() -> None:
+    client = _make_client(_search_handler)
+    reminders = await client.search_reminders(include_completed=True)
+    assert "t-done" in {r.uid for r in reminders}
+    await client.close()
+
+
+async def test_search_reminders_restrict_lists() -> None:
+    client = _make_client(_search_handler)
+    reminders = await client.search_reminders(lists=["Personal"])
+    assert {r.list for r in reminders} == {"Personal"}
+    assert {r.uid for r in reminders} == {"p-overdue", "p-someday"}
+    await client.close()
+
+
+async def test_search_reminders_unknown_list_raises() -> None:
+    client = _make_client(_search_handler)
+    with pytest.raises(CalDAVError, match="não encontrada"):
+        await client.search_reminders(lists=["Nope"])
+    await client.close()

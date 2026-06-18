@@ -630,6 +630,41 @@ async def list_reminders(
 
 
 @mcp.tool()
+async def search_reminders(
+    ctx: Context,  # type: ignore[type-arg]
+    query: str | None = None,
+    due_before: str | None = None,
+    due_after: str | None = None,
+    include_completed: bool = False,
+    undated: bool = True,
+    lists: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Search reminders across all lists (or a subset), ordered by due date.
+
+    Presets: overdue → due_before=now & undated=False; due today → due_before
+    set to end of today & undated=False; free-text → query.
+
+    Args:
+        query: Case-insensitive substring matched against title and notes.
+        due_before: Keep dated tasks due strictly before this (ISO 8601).
+        due_after: Keep dated tasks due at/after this (ISO 8601).
+        include_completed: When False (default), completed tasks are hidden.
+        undated: Include tasks without a due date (default True).
+        lists: Restrict to these list names; None searches every list.
+    """
+    app = _get_ctx(ctx)
+    reminders = await app.caldav_client.search_reminders(
+        query=query,
+        due_before=_parse_datetime(due_before, "due_before") if due_before else None,
+        due_after=_parse_datetime(due_after, "due_after") if due_after else None,
+        include_completed=include_completed,
+        undated=undated,
+        lists=lists,
+    )
+    return [r.model_dump(mode="json") for r in reminders]
+
+
+@mcp.tool()
 async def get_reminder(ctx: Context, list: str, uid: str) -> dict[str, Any]:  # type: ignore[type-arg]
     """Fetch a single reminder by its iCalendar UID."""
     app = _get_ctx(ctx)

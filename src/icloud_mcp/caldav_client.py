@@ -521,12 +521,86 @@ class CalDAVClient:
             title.
         """
         rlist = await self._resolve_reminder_list(list)
-        root = await self._report(rlist.url, _vtodo_query_body(), depth="1")
-        reminders = self._parse_todo_responses(root, rlist.name, rlist.url)
+        reminders = await self._fetch_list_reminders(rlist)
         if not include_completed:
             reminders = [r for r in reminders if not r.completed]
         reminders.sort(key=_reminder_sort_key)
         return reminders
+
+    async def search_reminders(
+        self,
+        query: str | None = None,
+        due_before: datetime | None = None,
+        due_after: datetime | None = None,
+        include_completed: bool = False,
+        undated: bool = True,
+        lists: list[str] | None = None,
+    ) -> list[Reminder]:
+        """Search reminders across one or more lists, ordered by due date.
+
+        Lists are fetched concurrently. Common presets: "overdue" =
+        ``due_before=now, undated=False``; "due today" = ``due_before`` set to
+        the end of today, ``undated=False``; free-text via ``query``.
+
+        Args:
+            query: Case-insensitive substring matched against ``summary`` and
+                ``description``.
+            due_before: Keep dated reminders with ``due`` strictly before this.
+            due_after: Keep dated reminders with ``due`` at/after this.
+            include_completed: When ``False`` (default), completed tasks are
+                dropped.
+            undated: Whether to include reminders without a ``due`` date. When a
+                due window is set, undated tasks are kept only if this is
+                ``True`` (they can't match a date bound).
+            lists: Restrict to these list display names; ``None`` searches all.
+
+        Raises:
+            CalDAVError: If ``lists`` names an unknown list.
+        """
+        all_lists = await self.list_reminder_lists()
+        if lists is None:
+            targets = all_lists
+        else:
+            by_name = {rl.name.lower(): rl for rl in all_lists}
+            missing = [name for name in lists if name.lower() not in by_name]
+            if missing:
+                available = ", ".join(rl.name for rl in all_lists) or "(nenhuma)"
+                raise CalDAVError(
+                    f"Lista(s) de lembretes não encontrada(s): {', '.join(missing)}. "
+                    f"Disponíveis: {available}."
+                )
+            targets = [by_name[name.lower()] for name in lists]
+        batches = await asyncio.gather(*(self._fetch_list_reminders(rl) for rl in targets))
+        reminders = [r for batch in batches for r in batch]
+        needle = query.lower() if query else None
+        after = _ensure_aware(due_after) if due_after else None
+        before = _ensure_aware(due_before) if due_before else None
+        filtered: list[Reminder] = []
+        for r in reminders:
+            if not include_completed and r.completed:
+                continue
+            if (
+                needle is not None
+                and needle not in r.summary.lower()
+                and (r.description is None or needle not in r.description.lower())
+            ):
+                continue
+            if r.due is None:
+                if not undated:
+                    continue
+            else:
+                if after is not None and r.due < after:
+                    continue
+                if before is not None and r.due >= before:
+                    continue
+            filtered.append(r)
+        filtered.sort(key=_reminder_sort_key)
+        return filtered
+
+    async def _fetch_list_reminders(self, rlist: ReminderList) -> list[Reminder]:
+        """Fetch every reminder of one list (unfiltered, unsorted)."""
+        root = await self._report(rlist.url, _vtodo_query_body(), depth="1")
+        return self._parse_todo_responses(root, rlist.name, rlist.url)
 
     async def get_reminder(self, list: str, uid: str) -> Reminder:
         """Fetch a single reminder by its iCalendar UID.

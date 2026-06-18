@@ -191,6 +191,7 @@ iCloud's server-side `expand` is unreliable, so recurrence is expanded **client-
 |------|------------|--------|-------------|
 | `list_reminder_lists` | — | `list[ReminderList]` | List Reminders lists (collections that support `VTODO`) |
 | `list_reminders` | `list: str`, `include_completed: bool = False` | `list[Reminder]` | Tasks in a list, ordered by `due` (undated last). Hides completed by default |
+| `search_reminders` | `query: str?`, `due_before: str?`, `due_after: str?`, `include_completed: bool = False`, `undated: bool = True`, `lists: list[str]?` | `list[Reminder]` | Search **across all lists** (or a subset), ordered by `due`. Presets: overdue (`due_before=now`, `undated=False`), due today (`due_before`=end of today, `undated=False`), free-text (`query`). Lists fetched concurrently |
 | `get_reminder` | `list: str`, `uid: str` | `Reminder` | Fetch a single reminder by iCalendar UID |
 | `create_reminder` | `list: str`, `summary: str`, `due: str?`, `start: str?`, `all_day: bool = False`, `priority: int?`, `description: str?`, `url: str?` | `Reminder` | Create a task; omit `due` for a task without a deadline |
 | `update_reminder` | `list: str`, `uid: str`, + optional `summary`/`due`/`start`/`all_day`/`priority`/`description`/`url`, `clear: list[str]?` | `Reminder` | Update the provided fields. `clear` unsets fields entirely (`due`/`start`/`description`/`url`/`priority`) — e.g. remove a deadline |

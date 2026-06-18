@@ -64,6 +64,7 @@ from icloud_mcp.server import (
     reply_email,
     save_draft,
     search_emails,
+    search_reminders,
     send_email,
     unflag_email,
     update_event,
@@ -986,3 +987,26 @@ async def test_delete_reminder_list_tool(mock_ctx: MockCtx) -> None:
 
     assert result == {"status": "deleted_list", "list": "Tasks"}
     caldav.delete_reminder_list.assert_called_once_with(name="Tasks", confirm=True)
+
+
+async def test_search_reminders_tool(mock_ctx: MockCtx) -> None:
+    """search_reminders parses date bounds and forwards all filters."""
+    ctx, *_ = mock_ctx
+    caldav = _caldav(ctx)
+    caldav.search_reminders.return_value = [
+        Reminder(uid="t1", list="Tasks", summary="Overdue", due=datetime(2026, 6, 10, tzinfo=UTC)),
+    ]
+
+    result = await search_reminders(
+        ctx, due_before="2026-06-18", undated=False, lists=["Tasks", "Personal"]
+    )
+
+    assert result[0]["uid"] == "t1"
+    caldav.search_reminders.assert_called_once_with(
+        query=None,
+        due_before=datetime(2026, 6, 18),
+        due_after=None,
+        include_completed=False,
+        undated=False,
+        lists=["Tasks", "Personal"],
+    )
