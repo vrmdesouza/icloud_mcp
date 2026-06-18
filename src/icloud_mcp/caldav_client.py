@@ -16,11 +16,14 @@ import asyncio
 import logging
 import uuid
 from datetime import UTC, date, datetime
+from typing import Any
 from xml.etree import ElementTree as ET
 
 import httpx
+import recurring_ical_events
 from icalendar import Calendar as ICalendar
 from icalendar import Event as IEvent
+from icalendar.prop import vRecur
 
 from icloud_mcp.config import ICloudMailSettings
 from icloud_mcp.exceptions import (
@@ -173,13 +176,18 @@ class CalDAVClient:
     ) -> list[CalendarEvent]:
         """List events in a calendar overlapping the ``[start, end)`` window.
 
+        Recurring events are expanded **client-side** into one
+        :class:`~icloud_mcp.models.CalendarEvent` per occurrence within the
+        window (each carries ``recurrence_id``). iCloud's server-side
+        ``expand`` is unreliable, so it is never used.
+
         Args:
             calendar: Calendar display name.
             start: Inclusive lower bound of the time range.
             end: Exclusive upper bound of the time range.
 
         Returns:
-            Events ordered by start time (ascending).
+            Events (and recurrence occurrences) ordered by start time.
         """
         cal = await self._resolve_calendar(calendar)
         body = (
@@ -192,7 +200,7 @@ class CalDAVClient:
             "</c:calendar-query>"
         )
         root = await self._report(cal.url, body, depth="1")
-        events = self._parse_event_responses(root, cal)
+        events = self._parse_event_responses(root, cal, window=(start, end))
         events.sort(key=lambda e: e.start)
         return events
 
@@ -219,12 +227,17 @@ class CalDAVClient:
         all_day: bool = False,
         location: str | None = None,
         description: str | None = None,
+        rrule: str | None = None,
     ) -> CalendarEvent:
         """Create a new event and return it as stored on the server.
 
         The event is written at ``{calendar.url}{uid}.ics`` with
         ``If-None-Match: *`` so an accidental collision never overwrites an
         existing resource.
+
+        Args:
+            rrule: Optional recurrence rule (e.g. ``"FREQ=WEEKLY;BYDAY=MO"``)
+                to make this a recurring series. Validated before the PUT.
         """
         cal = await self._resolve_calendar(calendar)
         uid = f"{uuid.uuid4()}"
@@ -236,6 +249,7 @@ class CalDAVClient:
             all_day=all_day,
             location=location,
             description=description,
+            rrule=rrule,
         )
         href = str(httpx.URL(cal.url).join(f"{uid}.ics"))
         resp = await self._request(
@@ -256,6 +270,8 @@ class CalDAVClient:
             description=description,
             href=href,
             etag=etag,
+            rrule=rrule,
+            is_recurring=bool(rrule),
         )
 
     async def update_event(
@@ -268,13 +284,25 @@ class CalDAVClient:
         all_day: bool | None = None,
         location: str | None = None,
         description: str | None = None,
+        rrule: str | None = None,
     ) -> CalendarEvent:
-        """Update fields of an existing event.
+        """Update fields of an existing event (the whole series for recurring ones).
 
         Only the provided fields change; the rest keep their current values.
         The write uses ``If-Match`` with the current ETag for safe concurrency.
+
+        Args:
+            rrule: ``None`` keeps the current recurrence; an empty string ``""``
+                removes recurrence (turns it into a one-off); any other value
+                replaces the recurrence rule.
         """
         existing = await self.get_event(calendar, uid)
+        if rrule is None:
+            new_rrule = existing.rrule
+        elif rrule == "":
+            new_rrule = None
+        else:
+            new_rrule = rrule
         merged = existing.model_copy(
             update={
                 k: v
@@ -289,6 +317,8 @@ class CalDAVClient:
                 if v is not None
             }
         )
+        merged.rrule = new_rrule
+        merged.is_recurring = bool(new_rrule)
         ics = _build_vevent(
             uid=uid,
             summary=merged.summary,
@@ -297,6 +327,7 @@ class CalDAVClient:
             all_day=merged.all_day,
             location=merged.location,
             description=merged.description,
+            rrule=new_rrule,
         )
         if existing.href is None:
             raise CalDAVError(f"Evento '{uid}' não possui href para atualização.")
@@ -332,25 +363,38 @@ class CalDAVClient:
             "</c:calendar-query>"
         )
         root = await self._report(cal.url, body, depth="1")
-        events = self._parse_event_responses(root, cal)
+        events = self._parse_event_responses(root, cal, window=None)
         return events[0] if events else None
 
-    def _parse_event_responses(self, root: ET.Element, cal: Calendar) -> list[CalendarEvent]:
+    def _parse_event_responses(
+        self,
+        root: ET.Element,
+        cal: Calendar,
+        window: tuple[datetime, datetime] | None,
+    ) -> list[CalendarEvent]:
+        """Turn REPORT responses into events.
+
+        With ``window`` set, recurring resources are expanded into their
+        occurrences inside ``[window[0], window[1])``. With ``window`` ``None``,
+        each resource yields its master event (``RRULE`` preserved, not expanded).
+        """
         events: list[CalendarEvent] = []
         for resp in root.findall("d:response", _NS):
             href = _text(resp.find("d:href", _NS))
             propstat = _ok_propstat(resp)
             if href is None or propstat is None:
                 continue
-            etag = _text(propstat.find("d:prop/d:getetag", _NS))
+            etag = _strip_etag(_text(propstat.find("d:prop/d:getetag", _NS)))
             data = _text(propstat.find("d:prop/c:calendar-data", _NS))
             if not data:
                 continue
-            event = _parse_ics(
-                data, cal.name, str(httpx.URL(cal.url).join(href)), _strip_etag(etag)
-            )
-            if event is not None:
-                events.append(event)
+            full_href = str(httpx.URL(cal.url).join(href))
+            if window is None:
+                master = _parse_ics_master(data, cal.name, full_href, etag)
+                if master is not None:
+                    events.append(master)
+            else:
+                events.extend(_expand_ics(data, cal.name, full_href, etag, window))
         return events
 
     async def _require_home(self) -> str:
@@ -490,6 +534,30 @@ def _caldav_dt(value: datetime) -> str:
     return value.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
 
 
+def _build_rrule(rrule: str) -> Any:
+    """Validate and parse a raw RRULE string into an icalendar vRecur.
+
+    Args:
+        rrule: A recurrence rule, with or without the ``RRULE:`` prefix
+            (e.g. ``"FREQ=WEEKLY;BYDAY=MO"``).
+
+    Raises:
+        CalDAVError: If the rule cannot be parsed.
+    """
+    cleaned = rrule.strip()
+    if cleaned.upper().startswith("RRULE:"):
+        cleaned = cleaned[len("RRULE:") :]
+    try:
+        recur = vRecur.from_ical(cleaned)
+    except (ValueError, KeyError) as exc:
+        raise CalDAVError(
+            f"RRULE inválida: '{rrule}'. Use sintaxe iCalendar, ex.: 'FREQ=WEEKLY;BYDAY=MO'."
+        ) from exc
+    if "FREQ" not in recur:
+        raise CalDAVError(f"RRULE inválida: '{rrule}'. A regra precisa conter 'FREQ'.")
+    return recur
+
+
 def _build_vevent(
     *,
     uid: str,
@@ -499,6 +567,7 @@ def _build_vevent(
     all_day: bool,
     location: str | None,
     description: str | None,
+    rrule: str | None = None,
 ) -> bytes:
     """Serialize a single-event VCALENDAR document to iCalendar bytes."""
     cal = ICalendar()
@@ -518,6 +587,8 @@ def _build_vevent(
         event.add("location", location)
     if description:
         event.add("description", description)
+    if rrule:
+        event.add("rrule", _build_rrule(rrule))
     cal.add_component(event)
     result: bytes = cal.to_ical()
     return result
@@ -527,33 +598,136 @@ def _ensure_aware(value: datetime) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
-def _parse_ics(data: str, calendar_name: str, href: str, etag: str | None) -> CalendarEvent | None:
-    """Parse the first VEVENT of an iCalendar document into a CalendarEvent."""
+def _safe_parse(data: str, href: str) -> Any:
+    """Parse an iCalendar document, logging and skipping malformed input."""
     try:
-        cal = ICalendar.from_ical(data)
+        return ICalendar.from_ical(data)
     except ValueError as exc:
         log.warning("VEVENT malformado ignorado (%s): %s", href, exc)
         return None
+
+
+def _recurrence_info(cal: Any) -> tuple[bool, str | None]:
+    """Inspect a VCALENDAR for recurrence: ``(is_recurring, rrule_string)``.
+
+    ``rrule_string`` comes from the master VEVENT (the one carrying ``RRULE``);
+    an ``RDATE``-only series is recurring but has no ``RRULE`` string.
+    """
+    recurring = False
     for comp in cal.walk("VEVENT"):
-        dtstart_prop = comp.get("dtstart")
-        if dtstart_prop is None:
-            continue
-        start, all_day = _coerce_dt(dtstart_prop.dt)
-        dtend_prop = comp.get("dtend")
-        end = _coerce_dt(dtend_prop.dt)[0] if dtend_prop is not None else start
-        return CalendarEvent(
-            uid=str(comp.get("uid", "")),
-            calendar=calendar_name,
-            summary=str(comp.get("summary", "")),
-            start=start,
-            end=end,
-            all_day=all_day,
-            location=_opt_str(comp.get("location")),
-            description=_opt_str(comp.get("description")),
-            href=href,
-            etag=etag,
+        rrule_prop = comp.get("rrule")
+        if rrule_prop is not None:
+            decoded: str = rrule_prop.to_ical().decode()
+            return True, decoded
+        if comp.get("rdate") is not None:
+            recurring = True
+    return recurring, None
+
+
+def _master_component(cal: Any) -> Any:
+    """Return the series master (VEVENT with RRULE) or the first VEVENT."""
+    first: Any = None
+    for comp in cal.walk("VEVENT"):
+        if first is None:
+            first = comp
+        if comp.get("rrule") is not None:
+            return comp
+    return first
+
+
+def _component_to_event(
+    comp: Any,
+    calendar_name: str,
+    href: str,
+    etag: str | None,
+    *,
+    rrule: str | None,
+    is_recurring: bool,
+    recurrence_id: datetime | None = None,
+) -> CalendarEvent | None:
+    """Build a CalendarEvent from an icalendar VEVENT component."""
+    dtstart_prop = comp.get("dtstart")
+    if dtstart_prop is None:
+        return None
+    start, all_day = _coerce_dt(dtstart_prop.dt)
+    dtend_prop = comp.get("dtend")
+    end = _coerce_dt(dtend_prop.dt)[0] if dtend_prop is not None else start
+    return CalendarEvent(
+        uid=str(comp.get("uid", "")),
+        calendar=calendar_name,
+        summary=str(comp.get("summary", "")),
+        start=start,
+        end=end,
+        all_day=all_day,
+        location=_opt_str(comp.get("location")),
+        description=_opt_str(comp.get("description")),
+        href=href,
+        etag=etag,
+        rrule=rrule,
+        is_recurring=is_recurring,
+        recurrence_id=recurrence_id,
+    )
+
+
+def _parse_ics_master(
+    data: str, calendar_name: str, href: str, etag: str | None
+) -> CalendarEvent | None:
+    """Parse the master event of a resource, preserving its RRULE (no expansion)."""
+    cal = _safe_parse(data, href)
+    if cal is None:
+        return None
+    is_recurring, rrule = _recurrence_info(cal)
+    master = _master_component(cal)
+    if master is None:
+        return None
+    return _component_to_event(
+        master, calendar_name, href, etag, rrule=rrule, is_recurring=is_recurring
+    )
+
+
+def _expand_ics(
+    data: str,
+    calendar_name: str,
+    href: str,
+    etag: str | None,
+    window: tuple[datetime, datetime],
+) -> list[CalendarEvent]:
+    """Expand a resource into its occurrences within ``window``.
+
+    Non-recurring events pass through as a single occurrence. On expansion
+    failure (exotic rules), falls back to the unexpanded master.
+    """
+    cal = _safe_parse(data, href)
+    if cal is None:
+        return []
+    is_recurring, rrule = _recurrence_info(cal)
+    win_start = _ensure_aware(window[0])
+    win_end = _ensure_aware(window[1])
+    try:
+        occurrences = recurring_ical_events.of(cal).between(win_start, win_end)
+    except Exception as exc:  # noqa: BLE001 — exotic RRULEs can raise; degrade gracefully
+        log.warning("Falha ao expandir recorrência (%s): %s", href, exc)
+        master = _parse_ics_master(data, calendar_name, href, etag)
+        return [master] if master is not None else []
+    events: list[CalendarEvent] = []
+    for occ in occurrences:
+        recurrence_id: datetime | None = None
+        if is_recurring:
+            rid_prop = occ.get("recurrence-id")
+            if rid_prop is not None:
+                recurrence_id = _coerce_dt(rid_prop.dt)[0]
+        event = _component_to_event(
+            occ,
+            calendar_name,
+            href,
+            etag,
+            rrule=rrule,
+            is_recurring=is_recurring,
+            recurrence_id=recurrence_id,
         )
-    return None
+        if event is not None:
+            events.append(event)
+    return events
 
 
 def _coerce_dt(value: datetime | date) -> tuple[datetime, bool]:

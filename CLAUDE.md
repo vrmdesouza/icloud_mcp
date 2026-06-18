@@ -167,11 +167,18 @@ class CalDAVAuthenticationError(CalDAVError): ...
 | Tool | Parameters | Return | Description |
 |------|------------|--------|-------------|
 | `list_calendars` | — | `list[Calendar]` | List calendars that support events |
-| `list_events` | `calendar: str`, `start: str`, `end: str` | `list[CalendarEvent]` | Events overlapping the `[start, end)` time range (ISO 8601) |
-| `get_event` | `calendar: str`, `uid: str` | `CalendarEvent` | Fetch a single event by iCalendar UID |
-| `create_event` | `calendar: str`, `summary: str`, `start: str`, `end: str`, `all_day: bool = False`, `location: str?`, `description: str?` | `CalendarEvent` | Create a new event |
-| `update_event` | `calendar: str`, `uid: str`, + optional `summary`/`start`/`end`/`all_day`/`location`/`description` | `CalendarEvent` | Update only the provided fields |
-| `delete_event` | `calendar: str`, `uid: str` | `dict` | Delete an event by UID |
+| `list_events` | `calendar: str`, `start: str`, `end: str` | `list[CalendarEvent]` | Events overlapping the `[start, end)` time range (ISO 8601). Recurring series are expanded into one entry per occurrence. |
+| `get_event` | `calendar: str`, `uid: str` | `CalendarEvent` | Fetch a single event by iCalendar UID (series master, `RRULE` preserved, not expanded) |
+| `create_event` | `calendar: str`, `summary: str`, `start: str`, `end: str`, `all_day: bool = False`, `location: str?`, `description: str?`, `rrule: str?` | `CalendarEvent` | Create a new event; pass `rrule` for a recurring series |
+| `update_event` | `calendar: str`, `uid: str`, + optional `summary`/`start`/`end`/`all_day`/`location`/`description`/`rrule` | `CalendarEvent` | Update the provided fields (whole series). `rrule=""` removes recurrence |
+| `delete_event` | `calendar: str`, `uid: str` | `dict` | Delete an event/series by UID |
+
+#### Recurrence
+
+iCloud's server-side `expand` is unreliable, so recurrence is expanded **client-side** with `recurring-ical-events`:
+- `list_events` expands `RRULE`/`RDATE`/`EXDATE`/`RECURRENCE-ID` into concrete occurrences within the requested window (each carries `recurrence_id`, `is_recurring=True`). Expansion always requires a finite window.
+- `get_event` returns the **series master** with its `rrule` preserved — it does not expand.
+- `create_event`/`update_event` accept a raw `rrule` (e.g. `"FREQ=WEEKLY;BYDAY=MO"`), validated before the `PUT`. **Scope: whole series only.** Editing/deleting a single occurrence (`RECURRENCE-ID`/`EXDATE`) is intentionally out of scope.
 
 ### Pagination (`list_emails`)
 
@@ -227,6 +234,7 @@ testpaths = ["tests"]
 - `aiosmtplib` — async SMTP client
 - `httpx` — async HTTP client (CalDAV transport)
 - `icalendar` — build/parse iCalendar (`VEVENT`) documents
+- `recurring-ical-events` — client-side expansion of recurring events (`RRULE`/`EXDATE`/`RECURRENCE-ID`)
 - `pydantic-settings` — env var loading with validation
 - `python-dotenv` — `.env` file support in development
 - `ruff`, `mypy`, `pytest`, `pytest-asyncio` — dev dependencies

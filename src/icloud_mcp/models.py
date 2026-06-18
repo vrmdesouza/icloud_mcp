@@ -205,6 +205,13 @@ class CalendarEvent(BaseModel):
         description: Long-form notes (``DESCRIPTION``).
         href: CalDAV resource path of the event (``calendar.url`` + ``UID.ics``).
         etag: Server ETag, used for optimistic concurrency on update/delete.
+        rrule: Raw recurrence rule of the master event (``RRULE``), e.g.
+            ``"FREQ=WEEKLY;BYDAY=MO"``. ``None`` for non-recurring events.
+        is_recurring: ``True`` when the underlying resource carries an ``RRULE``
+            (or ``RDATE``) — i.e. this event belongs to a recurring series.
+        recurrence_id: For an expanded occurrence, the ``RECURRENCE-ID``
+            identifying which instance of the series this is. ``None`` for
+            non-recurring events and for the unexpanded master.
     """
 
     uid: str
@@ -217,3 +224,6 @@ class CalendarEvent(BaseModel):
     description: str | None = None
     href: str | None = None
     etag: str | None = None
+    rrule: str | None = None
+    is_recurring: bool = False
+    recurrence_id: datetime | None = None

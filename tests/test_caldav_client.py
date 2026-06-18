@@ -443,3 +443,213 @@ async def test_transport_error_retries(monkeypatch: pytest.MonkeyPatch) -> None:
     await client.connect()
     assert state["n"] == 2
     await client.close()
+
+
+# -- recurrence: fixtures & helpers ----------------------------------------
+
+
+def _raw_event_response(ics: str, name: str = "rec", etag: str = "etag-old") -> str:
+    """Wrap an arbitrary iCalendar document as a single REPORT response."""
+    return (
+        f"  <response>\n"
+        f"    <href>/123456/calendars/work/{name}.ics</href>\n"
+        f"    <propstat><prop>\n"
+        f'      <getetag>"{etag}"</getetag>\n'
+        f"      <c:calendar-data>{ics}</c:calendar-data>\n"
+        f"    </prop><status>HTTP/1.1 200 OK</status></propstat>\n"
+        f"  </response>\n"
+    )
+
+
+def _ics(*vevents: str, prodid: str = "-//t//EN") -> str:
+    body = "".join(vevents)
+    return f"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:{prodid}\r\n{body}END:VCALENDAR\r\n"
+
+
+# A weekly Monday standup starting 2026-06-01 (June 2026 Mondays: 1, 8, 15, 22, 29).
+WEEKLY_VEVENT = (
+    "BEGIN:VEVENT\r\nUID:weekly-1\r\nSUMMARY:Standup\r\n"
+    "DTSTART:20260601T090000Z\r\nDTEND:20260601T093000Z\r\n"
+    "RRULE:FREQ=WEEKLY;BYDAY=MO\r\nEND:VEVENT\r\n"
+)
+
+
+def _recurring_handler(ics: str) -> Handler:
+    """Handler that serves ``ics`` for any REPORT (time-range or UID query)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        disc = _discovery(request)
+        if disc is not None:
+            return disc
+        if request.method == "REPORT":
+            return httpx.Response(207, content=_events_multistatus(_raw_event_response(ics)))
+        if request.method == "PUT":
+            return httpx.Response(201, headers={"ETag": '"etag-new"'})
+        if request.method == "DELETE":
+            return httpx.Response(204)
+        return httpx.Response(500, text="unexpected")
+
+    return handler
+
+
+# -- recurrence: reading (client-side expansion) ---------------------------
+
+
+async def test_list_events_expands_recurring_series() -> None:
+    client = _make_client(_recurring_handler(_ics(WEEKLY_VEVENT)))
+    events = await client.list_events(
+        "Work", datetime(2026, 6, 1, tzinfo=UTC), datetime(2026, 6, 30, tzinfo=UTC)
+    )
+    # Five Mondays in June 2026, each a distinct occurrence of the same series.
+    assert len(events) == 5
+    assert {e.uid for e in events} == {"weekly-1"}
+    assert all(e.is_recurring for e in events)
+    assert all(e.rrule == "FREQ=WEEKLY;BYDAY=MO" for e in events)
+    assert [e.start.day for e in events] == [1, 8, 15, 22, 29]
+    assert all(e.recurrence_id is not None for e in events)
+    await client.close()
+
+
+async def test_list_events_respects_exdate() -> None:
+    vevent = (
+        "BEGIN:VEVENT\r\nUID:weekly-1\r\nSUMMARY:Standup\r\n"
+        "DTSTART:20260601T090000Z\r\nDTEND:20260601T093000Z\r\n"
+        "RRULE:FREQ=WEEKLY;BYDAY=MO\r\nEXDATE:20260608T090000Z\r\nEND:VEVENT\r\n"
+    )
+    client = _make_client(_recurring_handler(_ics(vevent)))
+    events = await client.list_events(
+        "Work", datetime(2026, 6, 1, tzinfo=UTC), datetime(2026, 6, 30, tzinfo=UTC)
+    )
+    # The June 8th occurrence is excluded via EXDATE.
+    assert [e.start.day for e in events] == [1, 15, 22, 29]
+    await client.close()
+
+
+async def test_list_events_applies_recurrence_override() -> None:
+    master = (
+        "BEGIN:VEVENT\r\nUID:weekly-1\r\nSUMMARY:Standup\r\n"
+        "DTSTART:20260601T090000Z\r\nDTEND:20260601T093000Z\r\n"
+        "RRULE:FREQ=WEEKLY;BYDAY=MO\r\nEND:VEVENT\r\n"
+    )
+    override = (
+        "BEGIN:VEVENT\r\nUID:weekly-1\r\nSUMMARY:Standup (moved room)\r\n"
+        "RECURRENCE-ID:20260608T090000Z\r\n"
+        "DTSTART:20260608T100000Z\r\nDTEND:20260608T103000Z\r\nEND:VEVENT\r\n"
+    )
+    client = _make_client(_recurring_handler(_ics(master, override)))
+    events = await client.list_events(
+        "Work", datetime(2026, 6, 1, tzinfo=UTC), datetime(2026, 6, 30, tzinfo=UTC)
+    )
+    moved = next(e for e in events if e.start.day == 8)
+    assert moved.summary == "Standup (moved room)"
+    assert moved.start.hour == 10
+    await client.close()
+
+
+async def test_get_event_preserves_rrule_without_expanding() -> None:
+    client = _make_client(_recurring_handler(_ics(WEEKLY_VEVENT)))
+    event = await client.get_event("Work", "weekly-1")
+    # get_event returns the series master, not an expanded occurrence.
+    assert event.is_recurring is True
+    assert event.rrule == "FREQ=WEEKLY;BYDAY=MO"
+    assert event.recurrence_id is None
+    assert event.start == datetime(2026, 6, 1, 9, tzinfo=UTC)
+    await client.close()
+
+
+async def test_non_recurring_event_has_no_recurrence_fields() -> None:
+    client = _make_client(_default_handler)
+    events = await client.list_events(
+        "Work", datetime(2026, 6, 1, tzinfo=UTC), datetime(2026, 6, 2, tzinfo=UTC)
+    )
+    assert events  # default handler returns two simple events
+    assert all(e.is_recurring is False for e in events)
+    assert all(e.rrule is None for e in events)
+    assert all(e.recurrence_id is None for e in events)
+    await client.close()
+
+
+# -- recurrence: writing ---------------------------------------------------
+
+
+async def test_create_recurring_event_puts_rrule() -> None:
+    captured: dict[str, bytes] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "PUT":
+            captured["body"] = request.content
+        return _default_handler(request)
+
+    client = _make_client(handler)
+    event = await client.create_event(
+        "Work",
+        summary="Standup",
+        start=datetime(2026, 6, 1, 9, tzinfo=UTC),
+        end=datetime(2026, 6, 1, 9, 30, tzinfo=UTC),
+        rrule="FREQ=WEEKLY;BYDAY=MO",
+    )
+    assert event.is_recurring is True
+    assert event.rrule == "FREQ=WEEKLY;BYDAY=MO"
+    assert b"RRULE:FREQ=WEEKLY;BYDAY=MO" in captured["body"]
+    await client.close()
+
+
+async def test_create_event_invalid_rrule_raises_before_put() -> None:
+    put_calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "PUT":
+            put_calls["n"] += 1
+        return _default_handler(request)
+
+    client = _make_client(handler)
+    with pytest.raises(CalDAVError, match="RRULE inválida"):
+        await client.create_event(
+            "Work",
+            summary="Bad",
+            start=datetime(2026, 6, 1, 9, tzinfo=UTC),
+            end=datetime(2026, 6, 1, 10, tzinfo=UTC),
+            rrule="this is not a rule",
+        )
+    assert put_calls["n"] == 0  # no write attempted
+    await client.close()
+
+
+async def test_update_event_removes_recurrence_with_empty_rrule() -> None:
+    captured: dict[str, bytes] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "PUT":
+            captured["body"] = request.content
+        if request.method == "REPORT":
+            return httpx.Response(
+                207, content=_events_multistatus(_raw_event_response(_ics(WEEKLY_VEVENT)))
+            )
+        return _default_handler(request)
+
+    client = _make_client(handler)
+    event = await client.update_event("Work", "weekly-1", rrule="")
+    assert event.is_recurring is False
+    assert event.rrule is None
+    assert b"RRULE" not in captured["body"]
+    await client.close()
+
+
+async def test_update_event_keeps_recurrence_when_rrule_omitted() -> None:
+    captured: dict[str, bytes] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "PUT":
+            captured["body"] = request.content
+        if request.method == "REPORT":
+            return httpx.Response(
+                207, content=_events_multistatus(_raw_event_response(_ics(WEEKLY_VEVENT)))
+            )
+        return _default_handler(request)
+
+    client = _make_client(handler)
+    event = await client.update_event("Work", "weekly-1", summary="Renamed standup")
+    assert event.summary == "Renamed standup"
+    assert event.is_recurring is True
+    assert b"RRULE:FREQ=WEEKLY;BYDAY=MO" in captured["body"]
+    await client.close()

@@ -532,3 +532,26 @@ Phase 21 (rules/filters)           ← depende de todas as acoes anteriores (apl
 - `pyproject.toml` — deps `httpx` + `icalendar`; override mypy tratando `icalendar` como modulo opaco.
 
 **Verificacao**: `uv run ruff check . && uv run ruff format --check . && uv run mypy src/ && uv run pytest -v`
+
+---
+
+## Phase 23: Recorrencia de eventos (serie inteira)
+
+**Objetivo**: Suporte a eventos recorrentes no Calendar. iCloud expoe a `RRULE` mas seu `expand` server-side e instavel — entao a expansao e feita **client-side**.
+
+**Resposta a "falha em ver ou em criar/editar?"**: a escrita (PUT de `VEVENT` com `RRULE`) funciona; o problema do iCloud e na **leitura/expansao** (`<C:expand>` erratico, time-range inconsistente). Alem disso, o codigo antigo descartava a `RRULE` no parse — mostrando o recorrente uma unica vez.
+
+**Decisoes-chave**:
+- **Expansao client-side** com `recurring-ical-events` (sobre `icalendar` + `python-dateutil`, ja no lock). Nunca usar o `expand` do iCloud.
+- **Deteccao de recorrencia vem do VCALENDAR mestre** (VEVENT com `RRULE`/`RDATE`), pois ocorrencias expandidas nao mantem `RRULE` e ate eventos simples recebem `RECURRENCE-ID` da lib.
+- **Escopo**: serie inteira. Editar/excluir ocorrencia unica (`RECURRENCE-ID`/`EXDATE`) fica para a Phase 24.
+
+**Arquivos modificados**:
+- `src/icloud_mcp/models.py` — `CalendarEvent` ganha `rrule`, `is_recurring`, `recurrence_id`.
+- `src/icloud_mcp/caldav_client.py` — `list_events` expande ocorrencias na janela; `get_event` preserva o mestre sem expandir; novos helpers `_recurrence_info`/`_master_component`/`_component_to_event`/`_parse_ics_master`/`_expand_ics`; `create_event`/`update_event` aceitam `rrule` (com `_build_rrule` validando antes do PUT; `rrule=""` no update remove a recorrencia).
+- `src/icloud_mcp/server.py` — tools `create_event`/`update_event` propagam `rrule`; docstrings de `list_events`/`update_event` atualizadas.
+- `tests/test_caldav_client.py` — expansao semanal, `EXDATE`, override `RECURRENCE-ID`, `get_event` preserva `RRULE`, nao-recorrente sem campos, create com `RRULE` valida/invalida, update remove/mantem recorrencia.
+- `tests/test_server.py` — handler `create_event` com `rrule`; asserts ajustados para o novo kwarg.
+- `pyproject.toml` — dep `recurring-ical-events`; override mypy para `recurring_ical_events`/`x_wr_timezone`.
+
+**Verificacao**: `uv run ruff check . && uv run ruff format --check . && uv run mypy src/ && uv run pytest -v` (209 passed)

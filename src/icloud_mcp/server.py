@@ -434,6 +434,9 @@ async def list_events(
 ) -> list[dict[str, Any]]:
     """List events in a calendar within a time range.
 
+    Recurring events are expanded into one entry per occurrence inside the
+    range; each occurrence carries ``recurrence_id`` and ``is_recurring=True``.
+
     Args:
         calendar: Calendar display name (see list_calendars).
         start: Range start, inclusive (ISO 8601, e.g. 2026-06-01 or 2026-06-01T09:00:00).
@@ -464,6 +467,7 @@ async def create_event(
     all_day: bool = False,
     location: str | None = None,
     description: str | None = None,
+    rrule: str | None = None,
 ) -> dict[str, Any]:
     """Create a new event in a calendar.
 
@@ -475,6 +479,8 @@ async def create_event(
         all_day: True for an all-day event (time component ignored).
         location: Optional location text.
         description: Optional notes.
+        rrule: Optional iCalendar recurrence rule to create a recurring series,
+            e.g. "FREQ=WEEKLY;BYDAY=MO" or "FREQ=DAILY;COUNT=10".
     """
     app = _get_ctx(ctx)
     event = await app.caldav_client.create_event(
@@ -485,6 +491,7 @@ async def create_event(
         all_day=all_day,
         location=location,
         description=description,
+        rrule=rrule,
     )
     return event.model_dump(mode="json")
 
@@ -500,8 +507,14 @@ async def update_event(
     all_day: bool | None = None,
     location: str | None = None,
     description: str | None = None,
+    rrule: str | None = None,
 ) -> dict[str, Any]:
-    """Update fields of an existing event. Only provided fields change."""
+    """Update fields of an existing event (whole series). Only provided fields change.
+
+    For recurring events this updates the entire series. Pass ``rrule=""`` to
+    remove recurrence (turn it into a one-off); a non-empty ``rrule`` replaces
+    the recurrence rule; omitting it keeps the current recurrence.
+    """
     app = _get_ctx(ctx)
     event = await app.caldav_client.update_event(
         calendar=calendar,
@@ -512,6 +525,7 @@ async def update_event(
         all_day=all_day,
         location=location,
         description=description,
+        rrule=rrule,
     )
     return event.model_dump(mode="json")
 

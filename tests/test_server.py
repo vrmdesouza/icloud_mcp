@@ -629,7 +629,35 @@ async def test_create_event_tool(mock_ctx: MockCtx) -> None:
         all_day=False,
         location="Cafe",
         description=None,
+        rrule=None,
     )
+
+
+async def test_create_event_tool_forwards_rrule(mock_ctx: MockCtx) -> None:
+    """create_event forwards the rrule argument to the client."""
+    ctx, *_ = mock_ctx
+    caldav = _caldav(ctx)
+    caldav.create_event.return_value = CalendarEvent(
+        uid="rec",
+        calendar="Work",
+        summary="Standup",
+        start=datetime(2026, 6, 1, 9, tzinfo=UTC),
+        end=datetime(2026, 6, 1, 9, 30, tzinfo=UTC),
+        rrule="FREQ=WEEKLY;BYDAY=MO",
+        is_recurring=True,
+    )
+
+    result = await create_event(
+        ctx,
+        calendar="Work",
+        summary="Standup",
+        start="2026-06-01T09:00:00",
+        end="2026-06-01T09:30:00",
+        rrule="FREQ=WEEKLY;BYDAY=MO",
+    )
+
+    assert result["is_recurring"] is True
+    assert caldav.create_event.call_args.kwargs["rrule"] == "FREQ=WEEKLY;BYDAY=MO"
 
 
 async def test_update_event_tool_partial(mock_ctx: MockCtx) -> None:
@@ -656,6 +684,7 @@ async def test_update_event_tool_partial(mock_ctx: MockCtx) -> None:
         all_day=None,
         location=None,
         description=None,
+        rrule=None,
     )
 
 

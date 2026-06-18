@@ -15,6 +15,7 @@ dependencies = [
     "python-dotenv",
     "httpx",
     "icalendar",
+    "recurring-ical-events",
 ]
 
 [project.optional-dependencies]
@@ -45,10 +46,18 @@ ignore_missing_imports = true
 
 # icalendar ships py.typed but its component constructors/.get are untyped,
 # which trips strict's no-untyped-call. Treat it as an opaque (Any) module.
+# recurring_ical_events / x_wr_timezone ship no py.typed at all.
 [[tool.mypy.overrides]]
-module = ["icalendar", "icalendar.*"]
+module = [
+    "icalendar",
+    "icalendar.*",
+    "recurring_ical_events",
+    "recurring_ical_events.*",
+    "x_wr_timezone",
+]
 follow_imports = "skip"
 follow_untyped_imports = true
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
