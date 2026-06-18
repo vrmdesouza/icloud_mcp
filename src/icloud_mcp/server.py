@@ -597,3 +597,134 @@ async def delete_occurrence(
         uid=uid,
         recurrence_id=_parse_datetime(recurrence_id, "recurrence_id"),
     )
+
+
+# -- Reminders (CalDAV VTODO) ----------------------------------------------
+
+
+@mcp.tool()
+async def list_reminder_lists(ctx: Context) -> list[dict[str, Any]]:  # type: ignore[type-arg]
+    """List all iCloud Reminders lists (CalDAV VTODO collections)."""
+    app = _get_ctx(ctx)
+    lists = await app.caldav_client.list_reminder_lists()
+    return [r.model_dump() for r in lists]
+
+
+@mcp.tool()
+async def list_reminders(
+    ctx: Context,  # type: ignore[type-arg]
+    list: str,
+    include_completed: bool = False,
+) -> list[dict[str, Any]]:
+    """List reminders (tasks) in a list, ordered by due date (undated last).
+
+    Args:
+        list: Reminders list display name (see list_reminder_lists).
+        include_completed: When False (default), completed tasks are hidden.
+    """
+    app = _get_ctx(ctx)
+    reminders = await app.caldav_client.list_reminders(
+        list=list, include_completed=include_completed
+    )
+    return [r.model_dump(mode="json") for r in reminders]
+
+
+@mcp.tool()
+async def get_reminder(ctx: Context, list: str, uid: str) -> dict[str, Any]:  # type: ignore[type-arg]
+    """Fetch a single reminder by its iCalendar UID."""
+    app = _get_ctx(ctx)
+    reminder = await app.caldav_client.get_reminder(list=list, uid=uid)
+    return reminder.model_dump(mode="json")
+
+
+@mcp.tool()
+async def create_reminder(
+    ctx: Context,  # type: ignore[type-arg]
+    list: str,
+    summary: str,
+    due: str | None = None,
+    start: str | None = None,
+    all_day: bool = False,
+    priority: int | None = None,
+    description: str | None = None,
+    url: str | None = None,
+) -> dict[str, Any]:
+    """Create a reminder in a list, with or without a due date.
+
+    Args:
+        list: Target reminders list display name.
+        summary: Task title.
+        due: Optional deadline (ISO 8601). Omit for a task without a deadline.
+        start: Optional start date/time (ISO 8601).
+        all_day: True to store due/start as a date (no time component).
+        priority: iCalendar PRIORITY (0 none, 1-4 high, 5 medium, 6-9 low).
+        description: Optional notes.
+        url: Optional associated URL.
+    """
+    app = _get_ctx(ctx)
+    reminder = await app.caldav_client.create_reminder(
+        list=list,
+        summary=summary,
+        due=_parse_datetime(due, "due") if due is not None else None,
+        start=_parse_datetime(start, "start") if start is not None else None,
+        all_day=all_day,
+        priority=priority,
+        description=description,
+        url=url,
+    )
+    return reminder.model_dump(mode="json")
+
+
+@mcp.tool()
+async def update_reminder(
+    ctx: Context,  # type: ignore[type-arg]
+    list: str,
+    uid: str,
+    summary: str | None = None,
+    due: str | None = None,
+    start: str | None = None,
+    all_day: bool | None = None,
+    priority: int | None = None,
+    description: str | None = None,
+    url: str | None = None,
+) -> dict[str, Any]:
+    """Update fields of an existing reminder. Only provided fields change.
+
+    Use complete_reminder/reopen_reminder to toggle completion.
+    """
+    app = _get_ctx(ctx)
+    reminder = await app.caldav_client.update_reminder(
+        list=list,
+        uid=uid,
+        summary=summary,
+        due=_parse_datetime(due, "due") if due is not None else None,
+        start=_parse_datetime(start, "start") if start is not None else None,
+        all_day=all_day,
+        priority=priority,
+        description=description,
+        url=url,
+    )
+    return reminder.model_dump(mode="json")
+
+
+@mcp.tool()
+async def complete_reminder(ctx: Context, list: str, uid: str) -> dict[str, Any]:  # type: ignore[type-arg]
+    """Mark a reminder as completed."""
+    app = _get_ctx(ctx)
+    reminder = await app.caldav_client.complete_reminder(list=list, uid=uid)
+    return reminder.model_dump(mode="json")
+
+
+@mcp.tool()
+async def reopen_reminder(ctx: Context, list: str, uid: str) -> dict[str, Any]:  # type: ignore[type-arg]
+    """Reopen a completed reminder (back to needs-action)."""
+    app = _get_ctx(ctx)
+    reminder = await app.caldav_client.reopen_reminder(list=list, uid=uid)
+    return reminder.model_dump(mode="json")
+
+
+@mcp.tool()
+async def delete_reminder(ctx: Context, list: str, uid: str) -> dict[str, str]:  # type: ignore[type-arg]
+    """Delete a reminder by its iCalendar UID."""
+    app = _get_ctx(ctx)
+    return await app.caldav_client.delete_reminder(list=list, uid=uid)

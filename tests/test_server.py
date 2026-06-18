@@ -16,6 +16,8 @@ from icloud_mcp.models import (
     EmailListResult,
     Folder,
     FolderStats,
+    Reminder,
+    ReminderList,
 )
 from icloud_mcp.rules import RulesEngine
 from icloud_mcp.server import (
@@ -23,13 +25,16 @@ from icloud_mcp.server import (
     app_lifespan,
     apply_rules,
     bulk_action,
+    complete_reminder,
     create_event,
     create_folder,
+    create_reminder,
     create_rule,
     delete_email,
     delete_event,
     delete_folder,
     delete_occurrence,
+    delete_reminder,
     delete_rule,
     download_attachment,
     flag_email,
@@ -37,17 +42,21 @@ from icloud_mcp.server import (
     get_email,
     get_event,
     get_folder_stats,
+    get_reminder,
     list_attachments,
     list_calendars,
     list_emails,
     list_events,
     list_folders,
+    list_reminder_lists,
+    list_reminders,
     list_rules,
     mark_as_read,
     mark_as_unread,
     mcp,
     move_email,
     rename_folder,
+    reopen_reminder,
     reply_email,
     save_draft,
     search_emails,
@@ -55,6 +64,7 @@ from icloud_mcp.server import (
     unflag_email,
     update_event,
     update_occurrence,
+    update_reminder,
 )
 
 MockCtx = tuple[MagicMock, AsyncMock, AsyncMock, RulesEngine]
@@ -758,3 +768,139 @@ async def test_delete_occurrence_tool(mock_ctx: MockCtx) -> None:
         uid="weekly-1",
         recurrence_id=datetime(2026, 6, 8, 9),
     )
+
+
+# -- Reminders (CalDAV VTODO) tool handlers --------------------------------
+
+
+async def test_list_reminder_lists_tool(mock_ctx: MockCtx) -> None:
+    """list_reminder_lists delegates to caldav_client and serializes models."""
+    ctx, *_ = mock_ctx
+    caldav = _caldav(ctx)
+    caldav.list_reminder_lists.return_value = [
+        ReminderList(name="Tasks", url="https://p1/cal/reminders/"),
+    ]
+
+    result = await list_reminder_lists(ctx)
+
+    assert result == [
+        {"name": "Tasks", "url": "https://p1/cal/reminders/", "color": None, "read_only": False}
+    ]
+    caldav.list_reminder_lists.assert_called_once()
+
+
+async def test_list_reminders_tool(mock_ctx: MockCtx) -> None:
+    """list_reminders forwards include_completed and serializes reminders."""
+    ctx, *_ = mock_ctx
+    caldav = _caldav(ctx)
+    caldav.list_reminders.return_value = [
+        Reminder(uid="t1", list="Tasks", summary="Buy milk"),
+    ]
+
+    result = await list_reminders(ctx, list="Tasks", include_completed=True)
+
+    assert result[0]["uid"] == "t1"
+    caldav.list_reminders.assert_called_once_with(list="Tasks", include_completed=True)
+
+
+async def test_get_reminder_tool(mock_ctx: MockCtx) -> None:
+    """get_reminder delegates to caldav_client and serializes the reminder."""
+    ctx, *_ = mock_ctx
+    caldav = _caldav(ctx)
+    caldav.get_reminder.return_value = Reminder(uid="t1", list="Tasks", summary="Buy milk")
+
+    result = await get_reminder(ctx, list="Tasks", uid="t1")
+
+    assert result["uid"] == "t1"
+    caldav.get_reminder.assert_called_once_with(list="Tasks", uid="t1")
+
+
+async def test_create_reminder_tool(mock_ctx: MockCtx) -> None:
+    """create_reminder parses due/start and forwards all fields."""
+    ctx, *_ = mock_ctx
+    caldav = _caldav(ctx)
+    caldav.create_reminder.return_value = Reminder(
+        uid="new", list="Tasks", summary="Pay rent", due=datetime(2026, 7, 1, 9, tzinfo=UTC)
+    )
+
+    result = await create_reminder(
+        ctx,
+        list="Tasks",
+        summary="Pay rent",
+        due="2026-07-01T09:00:00",
+        priority=1,
+    )
+
+    assert result["uid"] == "new"
+    caldav.create_reminder.assert_called_once_with(
+        list="Tasks",
+        summary="Pay rent",
+        due=datetime(2026, 7, 1, 9),
+        start=None,
+        all_day=False,
+        priority=1,
+        description=None,
+        url=None,
+    )
+
+
+async def test_update_reminder_tool(mock_ctx: MockCtx) -> None:
+    """update_reminder forwards only the provided fields (None for the rest)."""
+    ctx, *_ = mock_ctx
+    caldav = _caldav(ctx)
+    caldav.update_reminder.return_value = Reminder(uid="t1", list="Tasks", summary="Renamed")
+
+    result = await update_reminder(ctx, list="Tasks", uid="t1", summary="Renamed")
+
+    assert result["summary"] == "Renamed"
+    caldav.update_reminder.assert_called_once_with(
+        list="Tasks",
+        uid="t1",
+        summary="Renamed",
+        due=None,
+        start=None,
+        all_day=None,
+        priority=None,
+        description=None,
+        url=None,
+    )
+
+
+async def test_complete_reminder_tool(mock_ctx: MockCtx) -> None:
+    """complete_reminder delegates and serializes the completed reminder."""
+    ctx, *_ = mock_ctx
+    caldav = _caldav(ctx)
+    caldav.complete_reminder.return_value = Reminder(
+        uid="t1", list="Tasks", summary="Buy milk", completed=True
+    )
+
+    result = await complete_reminder(ctx, list="Tasks", uid="t1")
+
+    assert result["completed"] is True
+    caldav.complete_reminder.assert_called_once_with(list="Tasks", uid="t1")
+
+
+async def test_reopen_reminder_tool(mock_ctx: MockCtx) -> None:
+    """reopen_reminder delegates and serializes the reopened reminder."""
+    ctx, *_ = mock_ctx
+    caldav = _caldav(ctx)
+    caldav.reopen_reminder.return_value = Reminder(
+        uid="t1", list="Tasks", summary="Buy milk", completed=False
+    )
+
+    result = await reopen_reminder(ctx, list="Tasks", uid="t1")
+
+    assert result["completed"] is False
+    caldav.reopen_reminder.assert_called_once_with(list="Tasks", uid="t1")
+
+
+async def test_delete_reminder_tool(mock_ctx: MockCtx) -> None:
+    """delete_reminder delegates to caldav_client and returns its status dict."""
+    ctx, *_ = mock_ctx
+    caldav = _caldav(ctx)
+    caldav.delete_reminder.return_value = {"status": "deleted", "uid": "t1"}
+
+    result = await delete_reminder(ctx, list="Tasks", uid="t1")
+
+    assert result == {"status": "deleted", "uid": "t1"}
+    caldav.delete_reminder.assert_called_once_with(list="Tasks", uid="t1")

@@ -23,6 +23,7 @@ import httpx
 import recurring_ical_events
 from icalendar import Calendar as ICalendar
 from icalendar import Event as IEvent
+from icalendar import Todo as ITodo
 from icalendar.prop import vRecur
 
 from icloud_mcp.config import ICloudMailSettings
@@ -31,7 +32,7 @@ from icloud_mcp.exceptions import (
     CalDAVConnectionError,
     CalDAVError,
 )
-from icloud_mcp.models import Calendar, CalendarEvent
+from icloud_mcp.models import Calendar, CalendarEvent, Reminder, ReminderList
 
 log = logging.getLogger(__name__)
 
@@ -43,6 +44,24 @@ _NS = {"d": NS_DAV, "c": NS_CALDAV, "a": NS_APPLE}
 
 _PRODID = "-//icloud_mcp//iCloud MCP//EN"
 _RETRY_DELAYS = (1.0, 2.0)  # seconds; two retries on transient transport errors
+
+# PROPFIND body listing every collection under the home, with the properties
+# needed to classify it (event calendar vs. reminders list) and theme it.
+_COLLECTIONS_PROPFIND = (
+    '<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" '
+    'xmlns:a="http://apple.com/ns/ical/">'
+    "<d:prop>"
+    "<d:displayname/>"
+    "<d:resourcetype/>"
+    "<a:calendar-color/>"
+    "<c:supported-calendar-component-set/>"
+    "<d:current-user-privilege-set/>"
+    "</d:prop>"
+    "</d:propfind>"
+)
+
+# Far-future sentinel used to sort reminders without a due date last.
+_FAR_FUTURE = datetime.max.replace(tzinfo=UTC)
 
 
 class CalDAVClient:
@@ -122,19 +141,7 @@ class CalDAVClient:
             calendar collection in the account.
         """
         home = await self._require_home()
-        body = (
-            '<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" '
-            'xmlns:a="http://apple.com/ns/ical/">'
-            "<d:prop>"
-            "<d:displayname/>"
-            "<d:resourcetype/>"
-            "<a:calendar-color/>"
-            "<c:supported-calendar-component-set/>"
-            "<d:current-user-privilege-set/>"
-            "</d:prop>"
-            "</d:propfind>"
-        )
-        root = await self._propfind(home, body, depth="1")
+        root = await self._propfind(home, _COLLECTIONS_PROPFIND, depth="1")
         calendars: list[Calendar] = []
         for resp in root.findall("d:response", _NS):
             href = _text(resp.find("d:href", _NS))
@@ -443,6 +450,263 @@ class CalDAVClient:
         resp = await self._request("PUT", href, content=cal_obj.to_ical(), headers=headers)
         return _strip_etag(resp.headers.get("ETag")) or etag
 
+    # -- reminders (VTODO) -------------------------------------------------
+
+    async def list_reminder_lists(self) -> list[ReminderList]:
+        """List all Reminders lists (collections that support ``VTODO``).
+
+        Mirrors :meth:`list_calendars` but keeps only the collections whose
+        ``supported-calendar-component-set`` advertises ``VTODO`` — i.e. the
+        task lists, which :meth:`list_calendars` deliberately excludes.
+
+        Returns:
+            One :class:`~icloud_mcp.models.ReminderList` per task collection.
+        """
+        home = await self._require_home()
+        root = await self._propfind(home, _COLLECTIONS_PROPFIND, depth="1")
+        lists: list[ReminderList] = []
+        for resp in root.findall("d:response", _NS):
+            href = _text(resp.find("d:href", _NS))
+            if href is None:
+                continue
+            propstat = _ok_propstat(resp)
+            if propstat is None:
+                continue
+            resourcetype = propstat.find("d:prop/d:resourcetype", _NS)
+            if resourcetype is None or resourcetype.find("c:calendar", _NS) is None:
+                continue  # not a calendar collection (e.g. the home itself)
+            if not _supports_vtodo(propstat):
+                continue
+            name = _text(propstat.find("d:prop/d:displayname", _NS)) or href
+            color = _text(propstat.find("d:prop/a:calendar-color", _NS))
+            lists.append(
+                ReminderList(
+                    name=name,
+                    url=str(httpx.URL(home).join(href)),
+                    color=color[:7] if color else None,
+                    read_only=_is_read_only(propstat),
+                )
+            )
+        return lists
+
+    async def _resolve_reminder_list(self, list: str) -> ReminderList:
+        """Find a reminders list by display name (case-insensitive)."""
+        lists = await self.list_reminder_lists()
+        for rlist in lists:
+            if rlist.name.lower() == list.lower():
+                return rlist
+        available = ", ".join(rlist.name for rlist in lists) or "(nenhuma)"
+        raise CalDAVError(f"Lista de lembretes '{list}' não encontrada. Disponíveis: {available}.")
+
+    async def list_reminders(self, list: str, include_completed: bool = False) -> list[Reminder]:
+        """List reminders in a list, ordered by due date (undated last).
+
+        Args:
+            list: Reminders list display name.
+            include_completed: When ``False`` (default), completed tasks are
+                filtered out; when ``True``, they are included.
+
+        Returns:
+            Reminders ordered by ``due`` ascending, undated ones last, then by
+            title.
+        """
+        rlist = await self._resolve_reminder_list(list)
+        root = await self._report(rlist.url, _vtodo_query_body(), depth="1")
+        reminders = self._parse_todo_responses(root, rlist.name, rlist.url)
+        if not include_completed:
+            reminders = [r for r in reminders if not r.completed]
+        reminders.sort(key=_reminder_sort_key)
+        return reminders
+
+    async def get_reminder(self, list: str, uid: str) -> Reminder:
+        """Fetch a single reminder by its iCalendar UID.
+
+        Raises:
+            CalDAVError: If no reminder with the given UID exists.
+        """
+        rlist = await self._resolve_reminder_list(list)
+        root = await self._report(rlist.url, _uid_query_body(uid, comp="VTODO"), depth="1")
+        reminders = self._parse_todo_responses(root, rlist.name, rlist.url)
+        if not reminders:
+            raise CalDAVError(f"Lembrete com UID '{uid}' não encontrado na lista '{list}'.")
+        return reminders[0]
+
+    async def create_reminder(
+        self,
+        list: str,
+        summary: str,
+        due: datetime | None = None,
+        start: datetime | None = None,
+        all_day: bool = False,
+        priority: int | None = None,
+        description: str | None = None,
+        url: str | None = None,
+    ) -> Reminder:
+        """Create a reminder (with or without a ``due`` deadline).
+
+        Written at ``{list.url}{uid}.ics`` with ``If-None-Match: *`` so an
+        accidental collision never overwrites an existing resource.
+        """
+        rlist = await self._resolve_reminder_list(list)
+        uid = f"{uuid.uuid4()}"
+        ics = _build_vtodo(
+            uid=uid,
+            summary=summary,
+            due=due,
+            start=start,
+            all_day=all_day,
+            priority=priority,
+            description=description,
+            url=url,
+            completed=False,
+            completed_at=None,
+        )
+        href = str(httpx.URL(rlist.url).join(f"{uid}.ics"))
+        resp = await self._request(
+            "PUT",
+            href,
+            content=ics,
+            headers={"Content-Type": "text/calendar; charset=utf-8", "If-None-Match": "*"},
+        )
+        etag = _strip_etag(resp.headers.get("ETag"))
+        return Reminder(
+            uid=uid,
+            list=rlist.name,
+            summary=summary,
+            completed=False,
+            due=due,
+            start=start,
+            all_day=all_day,
+            priority=priority,
+            description=description,
+            url=url,
+            href=href,
+            etag=etag,
+        )
+
+    async def update_reminder(
+        self,
+        list: str,
+        uid: str,
+        summary: str | None = None,
+        due: datetime | None = None,
+        start: datetime | None = None,
+        all_day: bool | None = None,
+        priority: int | None = None,
+        description: str | None = None,
+        url: str | None = None,
+    ) -> Reminder:
+        """Update fields of an existing reminder; only provided fields change.
+
+        The whole resource is fetched and mutated in place (rather than rebuilt
+        from a model) so any unmodeled properties — e.g. an ``RRULE`` on a
+        recurring task — survive the round-trip. Uses ``If-Match`` for safe
+        concurrency.
+
+        Args:
+            all_day: When provided, switches ``due``/``start`` between
+                date-valued and datetime-valued; when omitted, the existing
+                kind is preserved.
+        """
+        rlist = await self._resolve_reminder_list(list)
+        cal_obj, href, etag = await self._fetch_todo_resource(rlist, uid)
+        todo = _require_todo(cal_obj, uid)
+        effective_all_day = _todo_all_day(todo) if all_day is None else all_day
+        if summary is not None:
+            _set_prop(todo, "summary", summary)
+        if description is not None:
+            _set_prop(todo, "description", description or None)
+        if url is not None:
+            _set_prop(todo, "url", url or None)
+        if priority is not None:
+            _set_prop(todo, "priority", priority)
+        if due is not None:
+            _set_todo_date(todo, "due", due, effective_all_day)
+        if start is not None:
+            _set_todo_date(todo, "dtstart", start, effective_all_day)
+        new_etag = await self._put_resource(href, cal_obj, etag)
+        return _component_to_reminder(todo, rlist.name, href, new_etag)
+
+    async def complete_reminder(self, list: str, uid: str) -> Reminder:
+        """Mark a reminder as completed (``STATUS:COMPLETED``, ``COMPLETED`` now)."""
+        return await self._set_completion(list, uid, completed=True)
+
+    async def reopen_reminder(self, list: str, uid: str) -> Reminder:
+        """Reopen a completed reminder (back to ``STATUS:NEEDS-ACTION``)."""
+        return await self._set_completion(list, uid, completed=False)
+
+    async def _set_completion(self, list: str, uid: str, *, completed: bool) -> Reminder:
+        """Toggle the completion state of a reminder, preserving other fields."""
+        rlist = await self._resolve_reminder_list(list)
+        cal_obj, href, etag = await self._fetch_todo_resource(rlist, uid)
+        todo = _require_todo(cal_obj, uid)
+        if completed:
+            _set_prop(todo, "status", "COMPLETED")
+            _set_prop(todo, "percent-complete", 100)
+            _set_prop(todo, "completed", datetime.now(UTC))
+        else:
+            _set_prop(todo, "status", "NEEDS-ACTION")
+            _set_prop(todo, "percent-complete", 0)
+            if "completed" in todo:
+                del todo["completed"]
+        new_etag = await self._put_resource(href, cal_obj, etag)
+        return _component_to_reminder(todo, rlist.name, href, new_etag)
+
+    async def delete_reminder(self, list: str, uid: str) -> dict[str, str]:
+        """Delete a reminder by UID. Returns a status dict."""
+        reminder = await self.get_reminder(list, uid)
+        if reminder.href is None:
+            raise CalDAVError(f"Lembrete '{uid}' não possui href para exclusão.")
+        headers = {"If-Match": reminder.etag} if reminder.etag else {}
+        await self._request("DELETE", reminder.href, headers=headers)
+        return {"status": "deleted", "uid": uid}
+
+    async def _fetch_todo_resource(
+        self, rlist: ReminderList, uid: str
+    ) -> tuple[Any, str, str | None]:
+        """Fetch the raw VCALENDAR resource for a reminder (preserving all props).
+
+        Returns ``(icalendar_calendar, full_href, etag)``.
+
+        Raises:
+            CalDAVError: If no resource with the given UID exists.
+        """
+        root = await self._report(rlist.url, _uid_query_body(uid, comp="VTODO"), depth="1")
+        for resp in root.findall("d:response", _NS):
+            href = _text(resp.find("d:href", _NS))
+            propstat = _ok_propstat(resp)
+            if href is None or propstat is None:
+                continue
+            data = _text(propstat.find("d:prop/c:calendar-data", _NS))
+            if not data:
+                continue
+            etag = _strip_etag(_text(propstat.find("d:prop/d:getetag", _NS)))
+            ical = _safe_parse(data, href)
+            if ical is None:
+                continue
+            return ical, str(httpx.URL(rlist.url).join(href)), etag
+        raise CalDAVError(f"Lembrete com UID '{uid}' não encontrado na lista '{rlist.name}'.")
+
+    def _parse_todo_responses(
+        self, root: ET.Element, list_name: str, list_url: str
+    ) -> list[Reminder]:
+        """Turn REPORT responses into reminders (one per ``VTODO`` resource)."""
+        reminders: list[Reminder] = []
+        for resp in root.findall("d:response", _NS):
+            href = _text(resp.find("d:href", _NS))
+            propstat = _ok_propstat(resp)
+            if href is None or propstat is None:
+                continue
+            etag = _strip_etag(_text(propstat.find("d:prop/d:getetag", _NS)))
+            data = _text(propstat.find("d:prop/c:calendar-data", _NS))
+            if not data:
+                continue
+            full_href = str(httpx.URL(list_url).join(href))
+            reminder = _parse_ics_todo(data, list_name, full_href, etag)
+            if reminder is not None:
+                reminders.append(reminder)
+        return reminders
+
     # -- internal helpers --------------------------------------------------
 
     async def _find_event(self, calendar: str, uid: str) -> CalendarEvent | None:
@@ -637,17 +901,29 @@ def _xml_escape(value: str) -> str:
     return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def _uid_query_body(uid: str) -> str:
-    """Build a calendar-query REPORT body filtering VEVENTs by UID."""
+def _uid_query_body(uid: str, comp: str = "VEVENT") -> str:
+    """Build a calendar-query REPORT body filtering ``comp`` components by UID."""
     return (
         '<c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">'
         "<d:prop><d:getetag/><c:calendar-data/></d:prop>"
         '<c:filter><c:comp-filter name="VCALENDAR">'
-        '<c:comp-filter name="VEVENT">'
+        f'<c:comp-filter name="{comp}">'
         f'<c:prop-filter name="UID">'
         f'<c:text-match collation="i;octet">{_xml_escape(uid)}</c:text-match>'
         "</c:prop-filter>"
         "</c:comp-filter></c:comp-filter></c:filter>"
+        "</c:calendar-query>"
+    )
+
+
+def _vtodo_query_body() -> str:
+    """Build a calendar-query REPORT body matching every VTODO in a collection."""
+    return (
+        '<c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">'
+        "<d:prop><d:getetag/><c:calendar-data/></d:prop>"
+        '<c:filter><c:comp-filter name="VCALENDAR">'
+        '<c:comp-filter name="VTODO"/>'
+        "</c:comp-filter></c:filter>"
         "</c:calendar-query>"
     )
 
@@ -992,3 +1268,141 @@ def _opt_str(value: object) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+# -- reminders (VTODO) helpers ---------------------------------------------
+
+
+def _supports_vtodo(propstat: ET.Element) -> bool:
+    """Whether a collection advertises ``VTODO`` (i.e. is a reminders list).
+
+    Unlike :func:`_supports_vevent`, an absent component set returns ``False``:
+    a collection that doesn't explicitly support tasks is not treated as one,
+    so plain calendars are never misclassified as reminders lists.
+    """
+    comp_set = propstat.find("d:prop/c:supported-calendar-component-set", _NS)
+    if comp_set is None:
+        return False
+    return any(comp.get("name") == "VTODO" for comp in comp_set.findall("c:comp", _NS))
+
+
+def _todo_component(cal: Any) -> Any:
+    """Return the first ``VTODO`` component of a parsed resource, or ``None``."""
+    for comp in cal.walk("VTODO"):
+        return comp
+    return None
+
+
+def _require_todo(cal_obj: Any, uid: str) -> Any:
+    """Return the resource's ``VTODO`` component, or raise if absent."""
+    todo = _todo_component(cal_obj)
+    if todo is None:
+        raise CalDAVError(f"Recurso do lembrete '{uid}' não contém um VTODO.")
+    return todo
+
+
+def _coerce_opt_dt(prop: Any) -> tuple[datetime | None, bool]:
+    """Coerce an optional icalendar date/datetime property to ``(dt, all_day)``."""
+    if prop is None:
+        return None, False
+    return _coerce_dt(prop.dt)
+
+
+def _todo_all_day(todo: Any) -> bool:
+    """Whether a VTODO's ``DUE``/``DTSTART`` are date-valued (all-day)."""
+    for name in ("due", "dtstart"):
+        prop = todo.get(name)
+        if prop is not None:
+            return not isinstance(prop.dt, datetime)
+    return False
+
+
+def _set_todo_date(todo: Any, name: str, value: datetime, all_day: bool) -> None:
+    """Set a VTODO date property as a date (all-day) or aware datetime."""
+    _set_prop(todo, name, value.date() if all_day else _ensure_aware(value))
+
+
+def _reminder_sort_key(reminder: Reminder) -> tuple[bool, datetime, str]:
+    """Sort key: dated reminders first (by due), undated last, then by title."""
+    return (reminder.due is None, reminder.due or _FAR_FUTURE, reminder.summary.lower())
+
+
+def _build_vtodo(
+    *,
+    uid: str,
+    summary: str,
+    due: datetime | None,
+    start: datetime | None,
+    all_day: bool,
+    priority: int | None,
+    description: str | None,
+    url: str | None,
+    completed: bool,
+    completed_at: datetime | None,
+) -> bytes:
+    """Serialize a single-task VCALENDAR document to iCalendar bytes."""
+    cal = ICalendar()
+    cal.add("prodid", _PRODID)
+    cal.add("version", "2.0")
+    todo = ITodo()
+    todo.add("uid", uid)
+    todo.add("summary", summary)
+    todo.add("dtstamp", datetime.now(UTC))
+    if start is not None:
+        todo.add("dtstart", start.date() if all_day else _ensure_aware(start))
+    if due is not None:
+        todo.add("due", due.date() if all_day else _ensure_aware(due))
+    if priority is not None:
+        todo.add("priority", priority)
+    if description:
+        todo.add("description", description)
+    if url:
+        todo.add("url", url)
+    if completed:
+        todo.add("status", "COMPLETED")
+        todo.add("percent-complete", 100)
+        todo.add("completed", completed_at or datetime.now(UTC))
+    else:
+        todo.add("status", "NEEDS-ACTION")
+    cal.add_component(todo)
+    result: bytes = cal.to_ical()
+    return result
+
+
+def _component_to_reminder(comp: Any, list_name: str, href: str, etag: str | None) -> Reminder:
+    """Build a :class:`Reminder` from an icalendar ``VTODO`` component."""
+    due, due_all_day = _coerce_opt_dt(comp.get("due"))
+    start, start_all_day = _coerce_opt_dt(comp.get("dtstart"))
+    all_day = due_all_day if comp.get("due") is not None else start_all_day
+    status = str(comp.get("status", "")).upper()
+    completed_prop = comp.get("completed")
+    completed = status == "COMPLETED" or completed_prop is not None
+    completed_at = _coerce_opt_dt(completed_prop)[0]
+    priority_prop = comp.get("priority")
+    priority = int(priority_prop) if priority_prop is not None else None
+    return Reminder(
+        uid=str(comp.get("uid", "")),
+        list=list_name,
+        summary=str(comp.get("summary", "")),
+        completed=completed,
+        completed_at=completed_at,
+        due=due,
+        start=start,
+        all_day=all_day,
+        priority=priority,
+        description=_opt_str(comp.get("description")),
+        url=_opt_str(comp.get("url")),
+        href=href,
+        etag=etag,
+    )
+
+
+def _parse_ics_todo(data: str, list_name: str, href: str, etag: str | None) -> Reminder | None:
+    """Parse the first ``VTODO`` of a resource into a :class:`Reminder`."""
+    cal = _safe_parse(data, href)
+    if cal is None:
+        return None
+    todo = _todo_component(cal)
+    if todo is None:
+        return None
+    return _component_to_reminder(todo, list_name, href, etag)

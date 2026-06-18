@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-`icloud_mcp` (the "iCloud MCP" server) is a Python MCP (Model Context Protocol) server that connects Claude to iCloud. It exposes tools for **Mail** (reading, searching, sending emails, managing folders) over IMAP/SMTP using a persistent IMAP connection pool, and for **Calendar** (viewing, creating, editing, deleting events) over CalDAV.
+`icloud_mcp` (the "iCloud MCP" server) is a Python MCP (Model Context Protocol) server that connects Claude to iCloud. It exposes tools for **Mail** (reading, searching, sending emails, managing folders) over IMAP/SMTP using a persistent IMAP connection pool, for **Calendar** (viewing, creating, editing, deleting events) over CalDAV (`VEVENT`), and for **Reminders** (viewing, creating, editing, completing, deleting tasks) over CalDAV (`VTODO`).
 
 ## Development Commands
 
@@ -89,7 +89,7 @@ src/icloud_mcp/
 ├── smtp_client.py    # SMTP client — creates connection per send operation
 ├── caldav_client.py  # Async CalDAV client (httpx) — Calendar discovery + event CRUD
 ├── rules.py          # Local JSON-backed mail filtering rules engine
-└── models.py         # Pydantic models: Email, Folder, Calendar, CalendarEvent, etc.
+└── models.py         # Pydantic models: Email, Folder, Calendar, CalendarEvent, ReminderList, Reminder, etc.
 
 tests/
 ├── conftest.py       # Shared fixtures (mock IMAP/SMTP connections)
@@ -111,7 +111,9 @@ tests/
 
 **Server entry point** (`server.py`): All MCP tools are registered here using the `@mcp.tool()` decorator from the official `mcp` SDK. Tools call into `imap_client` or `smtp_client` — no IMAP/SMTP logic belongs in `server.py`.
 
-**CalDAV is stateless** (`caldav_client.py`): No connection pool. A single `httpx.AsyncClient` carries Basic Auth across requests. At startup, `connect()` runs the two-step iCloud discovery (`current-user-principal` → `calendar-home-set`) and caches the resulting partition-host URL. Events are addressed by `href`/`ETag` we track ourselves, sidestepping iCloud's broken `get_object_by_uid`. Recurring events, attendees and alarms are intentionally out of scope for v1.
+**CalDAV is stateless** (`caldav_client.py`): No connection pool. A single `httpx.AsyncClient` carries Basic Auth across requests. At startup, `connect()` runs the two-step iCloud discovery (`current-user-principal` → `calendar-home-set`) and caches the resulting partition-host URL. Events are addressed by `href`/`ETag` we track ourselves, sidestepping iCloud's broken `get_object_by_uid`. Attendees and alarms are intentionally out of scope for v1.
+
+**Reminders share the CalDAV client** (`caldav_client.py`): iCloud Reminders lists are CalDAV collections under the **same** `calendar-home-set`, distinguished by a `supported-calendar-component-set` that advertises `VTODO` instead of `VEVENT`. `list_calendars()` filters these out (`_supports_vevent`); `list_reminder_lists()` keeps exactly them (`_supports_vtodo`). Reminders reuse all the existing HTTP plumbing, discovery, retry, and `If-Match`/`If-None-Match` concurrency. A reminder *with* a `DUE` is a deadline task (it shows on the calendar timeline); *without* `DUE` it is a plain task — both are read/written identically. Completion is `STATUS:COMPLETED` + `COMPLETED` + `PERCENT-COMPLETE`. Update/complete/reopen mutate the fetched resource in place (rather than rebuilding from a model) so unmodeled properties survive. **Out of scope (v1):** recurring reminders (an existing `RRULE` is preserved on update but never expanded or created), and iCloud-proprietary features that don't traverse CalDAV (tags, subtasks, smart lists, attachments, location/messaging triggers).
 
 **Config validation** (`config.py`): Reads env vars at startup and fails fast with a clear error if required vars are missing. Use `pydantic-settings` for this.
 
@@ -182,6 +184,21 @@ iCloud's server-side `expand` is unreliable, so recurrence is expanded **client-
 - `get_event` returns the **series master** with its `rrule` preserved — it does not expand.
 - `create_event`/`update_event` accept a raw `rrule` (e.g. `"FREQ=WEEKLY;BYDAY=MO"`), validated before the `PUT`. They operate on the **whole series**.
 - **Single occurrence**: `update_occurrence` adds/updates a `RECURRENCE-ID` override inside the same resource; `delete_occurrence` adds an `EXDATE` to the master (and drops any override for that slot). Both address the occurrence by `recurrence_id` (the original slot, as returned by `list_events`), validate it against the series, and PUT the whole resource with `If-Match`. The `RECURRENCE-ID`/`EXDATE` value type (date vs datetime) is derived from the master's `DTSTART`. **Out of scope:** "this and future" (`THISANDFUTURE`).
+
+### Reminder Tools (CalDAV `VTODO`)
+
+| Tool | Parameters | Return | Description |
+|------|------------|--------|-------------|
+| `list_reminder_lists` | — | `list[ReminderList]` | List Reminders lists (collections that support `VTODO`) |
+| `list_reminders` | `list: str`, `include_completed: bool = False` | `list[Reminder]` | Tasks in a list, ordered by `due` (undated last). Hides completed by default |
+| `get_reminder` | `list: str`, `uid: str` | `Reminder` | Fetch a single reminder by iCalendar UID |
+| `create_reminder` | `list: str`, `summary: str`, `due: str?`, `start: str?`, `all_day: bool = False`, `priority: int?`, `description: str?`, `url: str?` | `Reminder` | Create a task; omit `due` for a task without a deadline |
+| `update_reminder` | `list: str`, `uid: str`, + optional `summary`/`due`/`start`/`all_day`/`priority`/`description`/`url` | `Reminder` | Update the provided fields |
+| `complete_reminder` | `list: str`, `uid: str` | `Reminder` | Mark a task completed (`STATUS:COMPLETED`) |
+| `reopen_reminder` | `list: str`, `uid: str` | `Reminder` | Reopen a completed task (`STATUS:NEEDS-ACTION`) |
+| `delete_reminder` | `list: str`, `uid: str` | `dict` | Delete a task by UID |
+
+`priority` follows iCalendar: 0 = none, 1–4 = high, 5 = medium, 6–9 = low. Recurring reminders are **out of scope for v1** (see the CalDAV decision note above).
 
 ### Pagination (`list_emails`)
 

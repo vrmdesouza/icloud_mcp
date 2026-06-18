@@ -784,3 +784,254 @@ async def test_update_occurrence_unknown_slot_raises() -> None:
         )
     assert "body" not in captured
     await client.close()
+
+
+# -- reminders (VTODO): fixtures & helpers ----------------------------------
+
+
+def _vtodo(
+    uid: str,
+    summary: str,
+    *,
+    status: str = "NEEDS-ACTION",
+    due: str | None = None,
+    completed: str | None = None,
+    priority: int | None = None,
+    description: str | None = None,
+    url: str | None = None,
+) -> str:
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//test//EN",
+        "BEGIN:VTODO",
+        f"UID:{uid}",
+        f"SUMMARY:{summary}",
+        f"STATUS:{status}",
+    ]
+    if due is not None:
+        lines.append(f"DUE:{due}")
+    if completed is not None:
+        lines.append(f"COMPLETED:{completed}")
+    if priority is not None:
+        lines.append(f"PRIORITY:{priority}")
+    if description is not None:
+        lines.append(f"DESCRIPTION:{description}")
+    if url is not None:
+        lines.append(f"URL:{url}")
+    lines += ["END:VTODO", "END:VCALENDAR", ""]
+    return "\r\n".join(lines)
+
+
+def _todo_response(uid: str, ics: str, etag: str = "etag-old") -> str:
+    return (
+        f"  <response>\n"
+        f"    <href>/123456/calendars/reminders/{uid}.ics</href>\n"
+        f"    <propstat><prop>\n"
+        f'      <getetag>"{etag}"</getetag>\n'
+        f"      <c:calendar-data>{ics}</c:calendar-data>\n"
+        f"    </prop><status>HTTP/1.1 200 OK</status></propstat>\n"
+        f"  </response>\n"
+    )
+
+
+# Two tasks for list tests: one pending (with due), one completed (no due).
+_PENDING = _vtodo("todo-1", "Buy milk", due="20260620T100000Z", priority=5)
+_DONE = _vtodo("todo-2", "Old task", status="COMPLETED", completed="20260601T120000Z")
+_UNDATED = _vtodo("todo-3", "Someday")
+
+
+def _reminders_list_handler(request: httpx.Request) -> httpx.Response:
+    """Handler for read-only reminders list/get tests."""
+    disc = _discovery(request)
+    if disc is not None:
+        return disc
+    if request.method == "REPORT":
+        body = request.content.decode("utf-8")
+        if "text-match" not in body:  # list query (all VTODOs)
+            return httpx.Response(
+                207,
+                content=_events_multistatus(
+                    _todo_response("todo-3", _UNDATED, etag="e3"),
+                    _todo_response("todo-1", _PENDING, etag="e1"),
+                    _todo_response("todo-2", _DONE, etag="e2"),
+                ),
+            )
+        match = re.search(r"<c:text-match[^>]*>([^<]+)</c:text-match>", body)
+        uid = match.group(1) if match else ""
+        if uid == "missing-uid":
+            return httpx.Response(207, content=_events_multistatus())
+        return httpx.Response(
+            207, content=_events_multistatus(_todo_response(uid, _PENDING, etag="e1"))
+        )
+    if request.method == "DELETE":
+        return httpx.Response(204)
+    return httpx.Response(500, text="unexpected")
+
+
+def _todo_write_handler(ics: str, captured: dict[str, str], uid: str = "todo-1") -> Handler:
+    """Serve ``ics`` for any REPORT and capture the PUT/DELETE request."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        disc = _discovery(request)
+        if disc is not None:
+            return disc
+        if request.method == "REPORT":
+            return httpx.Response(207, content=_events_multistatus(_todo_response(uid, ics)))
+        if request.method == "PUT":
+            captured["body"] = request.content.decode()
+            captured["if_match"] = request.headers.get("If-Match") or ""
+            captured["if_none_match"] = request.headers.get("If-None-Match") or ""
+            return httpx.Response(201, headers={"ETag": '"etag-new"'})
+        if request.method == "DELETE":
+            captured["if_match"] = request.headers.get("If-Match") or ""
+            captured["url"] = str(request.url)
+            return httpx.Response(204)
+        return httpx.Response(500, text="unexpected")
+
+    return handler
+
+
+# -- reminders: lists ------------------------------------------------------
+
+
+async def test_list_reminder_lists_filters_vtodo() -> None:
+    client = _make_client(_default_handler)
+    lists = await client.list_reminder_lists()
+    # Only the VTODO collection ('Tasks') — event calendars are excluded.
+    assert {rl.name for rl in lists} == {"Tasks"}
+    tasks = lists[0]
+    assert tasks.url == "https://p99-caldav.icloud.com/123456/calendars/reminders/"
+    await client.close()
+
+
+async def test_resolve_unknown_reminder_list_raises() -> None:
+    client = _make_client(_default_handler)
+    with pytest.raises(CalDAVError, match="não encontrada"):
+        await client.list_reminders("Nope")
+    await client.close()
+
+
+# -- reminders: read -------------------------------------------------------
+
+
+async def test_list_reminders_hides_completed_by_default() -> None:
+    client = _make_client(_reminders_list_handler)
+    reminders = await client.list_reminders("Tasks")
+    # Completed 'todo-2' is filtered; dated 'todo-1' sorts before undated 'todo-3'.
+    assert [r.uid for r in reminders] == ["todo-1", "todo-3"]
+    assert all(not r.completed for r in reminders)
+    milk = reminders[0]
+    assert milk.summary == "Buy milk"
+    assert milk.due == datetime(2026, 6, 20, 10, 0, tzinfo=UTC)
+    assert milk.priority == 5
+    assert reminders[1].due is None  # undated reminder
+    await client.close()
+
+
+async def test_list_reminders_include_completed() -> None:
+    client = _make_client(_reminders_list_handler)
+    reminders = await client.list_reminders("Tasks", include_completed=True)
+    assert {r.uid for r in reminders} == {"todo-1", "todo-2", "todo-3"}
+    done = next(r for r in reminders if r.uid == "todo-2")
+    assert done.completed is True
+    assert done.completed_at == datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
+    await client.close()
+
+
+async def test_get_reminder_found() -> None:
+    client = _make_client(_reminders_list_handler)
+    reminder = await client.get_reminder("Tasks", "todo-1")
+    assert reminder.uid == "todo-1"
+    assert reminder.list == "Tasks"
+    assert reminder.href.endswith("/reminders/todo-1.ics")  # type: ignore[union-attr]
+    await client.close()
+
+
+async def test_get_reminder_missing_raises() -> None:
+    client = _make_client(_reminders_list_handler)
+    with pytest.raises(CalDAVError, match="não encontrado"):
+        await client.get_reminder("Tasks", "missing-uid")
+    await client.close()
+
+
+# -- reminders: write ------------------------------------------------------
+
+
+async def test_create_reminder_puts_vtodo() -> None:
+    captured: dict[str, str] = {}
+    client = _make_client(_todo_write_handler(_PENDING, captured))
+    reminder = await client.create_reminder(
+        "Tasks",
+        summary="Pay rent",
+        due=datetime(2026, 7, 1, 9, 0, tzinfo=UTC),
+        priority=1,
+        description="via app",
+    )
+    assert reminder.summary == "Pay rent"
+    assert reminder.completed is False
+    assert reminder.etag == "etag-new"
+    assert reminder.href is not None and reminder.href.endswith(".ics")
+    assert captured["if_none_match"] == "*"
+    assert "SUMMARY:Pay rent" in captured["body"]
+    assert "STATUS:NEEDS-ACTION" in captured["body"]
+    assert "DUE:20260701T090000Z" in captured["body"]
+    assert "PRIORITY:1" in captured["body"]
+    await client.close()
+
+
+async def test_create_reminder_without_due() -> None:
+    captured: dict[str, str] = {}
+    client = _make_client(_todo_write_handler(_UNDATED, captured))
+    reminder = await client.create_reminder("Tasks", summary="Someday maybe")
+    assert reminder.due is None
+    assert "DUE" not in captured["body"]
+    assert "SUMMARY:Someday maybe" in captured["body"]
+    await client.close()
+
+
+async def test_update_reminder_merges_and_sends_if_match() -> None:
+    captured: dict[str, str] = {}
+    client = _make_client(_todo_write_handler(_PENDING, captured))
+    reminder = await client.update_reminder("Tasks", "todo-1", summary="Buy oat milk")
+    assert reminder.summary == "Buy oat milk"
+    assert reminder.etag == "etag-new"
+    assert captured["if_match"] == "etag-old"
+    assert "SUMMARY:Buy oat milk" in captured["body"]
+    # Untouched properties survive the round-trip.
+    assert "DUE:20260620T100000Z" in captured["body"]
+    await client.close()
+
+
+async def test_complete_reminder_sets_completed() -> None:
+    captured: dict[str, str] = {}
+    client = _make_client(_todo_write_handler(_PENDING, captured))
+    reminder = await client.complete_reminder("Tasks", "todo-1")
+    assert reminder.completed is True
+    assert reminder.completed_at is not None
+    body = captured["body"]
+    assert "STATUS:COMPLETED" in body
+    assert "PERCENT-COMPLETE:100" in body
+    assert "COMPLETED:" in body
+    await client.close()
+
+
+async def test_reopen_reminder_clears_completion() -> None:
+    captured: dict[str, str] = {}
+    client = _make_client(_todo_write_handler(_DONE, captured, uid="todo-2"))
+    reminder = await client.reopen_reminder("Tasks", "todo-2")
+    assert reminder.completed is False
+    body = captured["body"]
+    assert "STATUS:NEEDS-ACTION" in body
+    assert "COMPLETED:" not in body
+    await client.close()
+
+
+async def test_delete_reminder_sends_if_match() -> None:
+    captured: dict[str, str] = {}
+    client = _make_client(_todo_write_handler(_PENDING, captured))
+    result = await client.delete_reminder("Tasks", "todo-1")
+    assert result == {"status": "deleted", "uid": "todo-1"}
+    assert captured["if_match"] == "etag-old"
+    assert captured["url"].endswith("/reminders/todo-1.ics")
+    await client.close()

@@ -227,3 +227,64 @@ class CalendarEvent(BaseModel):
     rrule: str | None = None
     is_recurring: bool = False
     recurrence_id: datetime | None = None
+
+
+class ReminderList(BaseModel):
+    """Represents an iCloud Reminders list (a CalDAV ``VTODO`` collection).
+
+    Structurally identical to :class:`Calendar`, but kept separate because the
+    underlying collection stores tasks (``VTODO``) rather than events.
+
+    Attributes:
+        name: Human-readable display name (``displayname`` property).
+        url: Absolute URL of the collection on the partition host.
+        color: List color as a hex string (``#RRGGBB``), if advertised.
+        read_only: ``True`` when the current user cannot write to the list.
+    """
+
+    name: str
+    url: str
+    color: str | None = None
+    read_only: bool = False
+
+
+class Reminder(BaseModel):
+    """Represents a single reminder/task (a ``VTODO`` component).
+
+    Datetimes are timezone-aware. ``due`` is the deadline that makes a reminder
+    show up in the calendar timeline; a reminder without ``due`` is a plain
+    task. For all-day reminders ``all_day`` is ``True`` and the time component
+    of ``due``/``start`` is not significant.
+
+    Recurring reminders (``RRULE``) are out of scope for v1: an existing rule is
+    preserved on update but neither expanded nor created.
+
+    Attributes:
+        uid: iCalendar ``UID`` — stable identifier of the reminder.
+        list: Name of the reminders list the task belongs to.
+        summary: Task title (``SUMMARY``).
+        completed: Whether the task is done (``STATUS:COMPLETED``).
+        completed_at: Completion timestamp (``COMPLETED``), if any.
+        due: Deadline (``DUE``). ``None`` for a task without a deadline.
+        start: Start date/time (``DTSTART``), if any.
+        all_day: Whether ``due``/``start`` are date-valued (no time component).
+        priority: iCalendar ``PRIORITY`` (0 none, 1-4 high, 5 medium, 6-9 low).
+        description: Long-form notes (``DESCRIPTION``).
+        url: Associated URL (``URL``).
+        href: CalDAV resource path of the reminder (``list.url`` + ``UID.ics``).
+        etag: Server ETag, used for optimistic concurrency on update/delete.
+    """
+
+    uid: str
+    list: str
+    summary: str = ""
+    completed: bool = False
+    completed_at: datetime | None = None
+    due: datetime | None = None
+    start: datetime | None = None
+    all_day: bool = False
+    priority: int | None = None
+    description: str | None = None
+    url: str | None = None
+    href: str | None = None
+    etag: str | None = None
