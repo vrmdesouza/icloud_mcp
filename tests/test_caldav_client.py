@@ -21,7 +21,7 @@ from icloud_mcp.exceptions import (
     CalDAVConnectionError,
     CalDAVError,
 )
-from icloud_mcp.models import Reminder
+from icloud_mcp.models import Reminder, ReminderAlarm
 
 # -- canned multistatus XML bodies -----------------------------------------
 
@@ -1484,3 +1484,91 @@ def test_apply_recurring_due_skips_completed_and_undated() -> None:
     _apply_recurring_due([completed, undated], now)
     assert completed.due == datetime(2026, 6, 1, tzinfo=UTC)  # untouched
     assert undated.due is None
+
+
+# -- reminders: Phase 4 (alarms / VALARM) ----------------------------------
+
+
+async def test_create_reminder_with_relative_alarm() -> None:
+    captured: dict[str, str] = {}
+    client = _make_client(_todo_write_handler(_PENDING, captured))
+    reminder = await client.create_reminder(
+        "Tasks",
+        summary="Pay rent",
+        due=datetime(2026, 7, 1, 9, tzinfo=UTC),
+        alarms=[ReminderAlarm(minutes_before=30)],
+    )
+    body = captured["body"]
+    assert "BEGIN:VALARM" in body
+    assert "ACTION:DISPLAY" in body
+    assert "TRIGGER;RELATED=END:-PT30M" in body
+    assert reminder.alarms == [ReminderAlarm(minutes_before=30)]
+    await client.close()
+
+
+async def test_create_reminder_with_absolute_alarm() -> None:
+    captured: dict[str, str] = {}
+    client = _make_client(_todo_write_handler(_PENDING, captured))
+    await client.create_reminder(
+        "Tasks",
+        summary="Call",
+        alarms=[ReminderAlarm(trigger=datetime(2026, 7, 1, 8, 0, tzinfo=UTC))],
+    )
+    body = captured["body"]
+    assert "TRIGGER;VALUE=DATE-TIME:20260701T080000Z" in body
+    await client.close()
+
+
+async def test_create_reminder_invalid_alarm_raises() -> None:
+    client = _make_client(_default_handler)
+    with pytest.raises(CalDAVError, match="exatamente um"):
+        await client.create_reminder("Tasks", summary="x", alarms=[ReminderAlarm()])
+    await client.close()
+
+
+async def test_reminder_parses_alarms() -> None:
+    ics = _vtodo(
+        "todo-a",
+        "Pay rent",
+        due="20260701T090000Z",
+        extra="BEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:x\r\n"
+        "TRIGGER;RELATED=END:-PT15M\r\nEND:VALARM",
+    )
+    captured: dict[str, str] = {}
+    client = _make_client(_todo_write_handler(ics, captured, uid="todo-a"))
+    reminder = await client.get_reminder("Tasks", "todo-a")
+    assert reminder.alarms == [ReminderAlarm(minutes_before=15)]
+    await client.close()
+
+
+async def test_update_reminder_replaces_alarms() -> None:
+    existing = _vtodo(
+        "todo-a",
+        "Pay rent",
+        due="20260701T090000Z",
+        extra="BEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:x\r\n"
+        "TRIGGER;RELATED=END:-PT15M\r\nEND:VALARM",
+    )
+    captured: dict[str, str] = {}
+    client = _make_client(_todo_write_handler(existing, captured, uid="todo-a"))
+    await client.update_reminder("Tasks", "todo-a", alarms=[ReminderAlarm(minutes_before=60)])
+    body = captured["body"]
+    assert "TRIGGER;RELATED=END:-PT1H" in body
+    assert body.count("BEGIN:VALARM") == 1  # old alarm replaced, not duplicated
+    await client.close()
+
+
+async def test_update_reminder_clears_alarms_with_empty_list() -> None:
+    existing = _vtodo(
+        "todo-a",
+        "Pay rent",
+        due="20260701T090000Z",
+        extra="BEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:x\r\n"
+        "TRIGGER;RELATED=END:-PT15M\r\nEND:VALARM",
+    )
+    captured: dict[str, str] = {}
+    client = _make_client(_todo_write_handler(existing, captured, uid="todo-a"))
+    reminder = await client.update_reminder("Tasks", "todo-a", alarms=[])
+    assert "BEGIN:VALARM" not in captured["body"]
+    assert reminder.alarms == []
+    await client.close()

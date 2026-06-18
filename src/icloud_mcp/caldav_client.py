@@ -22,6 +22,7 @@ from xml.etree import ElementTree as ET
 import httpx
 import recurring_ical_events
 from dateutil.rrule import rrulestr
+from icalendar import Alarm as IAlarm
 from icalendar import Calendar as ICalendar
 from icalendar import Event as IEvent
 from icalendar import Todo as ITodo
@@ -33,7 +34,7 @@ from icloud_mcp.exceptions import (
     CalDAVConnectionError,
     CalDAVError,
 )
-from icloud_mcp.models import Calendar, CalendarEvent, Reminder, ReminderList
+from icloud_mcp.models import Calendar, CalendarEvent, Reminder, ReminderAlarm, ReminderList
 
 log = logging.getLogger(__name__)
 
@@ -629,6 +630,7 @@ class CalDAVClient:
         description: str | None = None,
         url: str | None = None,
         rrule: str | None = None,
+        alarms: list[ReminderAlarm] | None = None,
     ) -> Reminder:
         """Create a reminder (with or without a ``due`` deadline).
 
@@ -638,6 +640,7 @@ class CalDAVClient:
         Args:
             rrule: Optional recurrence rule (e.g. ``"FREQ=WEEKLY;BYDAY=MO"``)
                 to make this a recurring task. Validated before the PUT.
+            alarms: Optional display alarms (``VALARM``) on the task.
         """
         rlist = await self._resolve_reminder_list(list)
         uid = f"{uuid.uuid4()}"
@@ -653,6 +656,7 @@ class CalDAVClient:
             completed=False,
             completed_at=None,
             rrule=rrule,
+            alarms=alarms,
         )
         href = str(httpx.URL(rlist.url).join(f"{uid}.ics"))
         resp = await self._request(
@@ -675,6 +679,7 @@ class CalDAVClient:
             url=url,
             rrule=rrule,
             is_recurring=bool(rrule),
+            alarms=alarms or [],
             href=href,
             etag=etag,
         )
@@ -691,13 +696,14 @@ class CalDAVClient:
         description: str | None = None,
         url: str | None = None,
         rrule: str | None = None,
+        alarms: list[ReminderAlarm] | None = None,
         clear: list[str] | None = None,
     ) -> Reminder:
         """Update fields of an existing reminder; only provided fields change.
 
         The whole resource is fetched and mutated in place (rather than rebuilt
-        from a model) so any unmodeled properties — e.g. a ``VALARM`` on the
-        task — survive the round-trip. Uses ``If-Match`` for safe concurrency.
+        from a model) so any unmodeled properties survive the round-trip. Uses
+        ``If-Match`` for safe concurrency.
 
         Args:
             all_day: When provided, switches ``due``/``start`` between
@@ -705,6 +711,8 @@ class CalDAVClient:
                 kind is preserved.
             rrule: ``None`` keeps the current recurrence; an empty string ``""``
                 removes recurrence; any other value replaces the rule.
+            alarms: ``None`` keeps the current alarms; any list (including the
+                empty list) replaces all alarms with the given set.
             clear: Field names to unset entirely (one or more of ``due``,
                 ``start``, ``description``, ``url``, ``priority``). Applied
                 before the set fields, so clearing and setting the same field
@@ -742,6 +750,8 @@ class CalDAVClient:
                     del todo["rrule"]
             else:
                 _set_prop(todo, "rrule", _build_rrule(rrule))
+        if alarms is not None:
+            _set_todo_alarms(todo, alarms, str(todo.get("summary", "")))
         new_etag = await self._put_resource(href, cal_obj, etag)
         return _component_to_reminder(todo, rlist.name, href, new_etag)
 
@@ -1558,6 +1568,7 @@ def _build_vtodo(
     completed: bool,
     completed_at: datetime | None,
     rrule: str | None = None,
+    alarms: list[ReminderAlarm] | None = None,
 ) -> bytes:
     """Serialize a single-task VCALENDAR document to iCalendar bytes."""
     cal = ICalendar()
@@ -1585,6 +1596,8 @@ def _build_vtodo(
         todo.add("completed", completed_at or datetime.now(UTC))
     else:
         todo.add("status", "NEEDS-ACTION")
+    if alarms:
+        _set_todo_alarms(todo, alarms, summary)
     cal.add_component(todo)
     result: bytes = cal.to_ical()
     return result
@@ -1618,6 +1631,7 @@ def _component_to_reminder(comp: Any, list_name: str, href: str, etag: str | Non
         url=_opt_str(comp.get("url")),
         rrule=rrule,
         is_recurring=is_recurring,
+        alarms=_parse_alarms(comp),
         created=_coerce_opt_dt(comp.get("created"))[0],
         modified=_coerce_opt_dt(comp.get("last-modified"))[0],
         href=href,
@@ -1693,6 +1707,50 @@ def _advance_recurring_todo(todo: Any, rrule_str: str) -> bool:
         shifted = _as_dt(prop.dt) + delta
         _set_prop(todo, name, shifted.date() if all_day else shifted)
     return True
+
+
+def _make_valarm(alarm: ReminderAlarm, summary: str) -> Any:
+    """Build a DISPLAY ``VALARM`` from a :class:`ReminderAlarm`.
+
+    Raises:
+        CalDAVError: If the alarm has neither (or both) trigger fields set.
+    """
+    if (alarm.trigger is None) == (alarm.minutes_before is None):
+        raise CalDAVError("Cada alarme precisa de exatamente um de 'minutes_before' ou 'trigger'.")
+    valarm = IAlarm()
+    valarm.add("action", "DISPLAY")
+    valarm.add("description", summary or "Lembrete")
+    if alarm.trigger is not None:
+        valarm.add("trigger", _ensure_aware(alarm.trigger), parameters={"VALUE": "DATE-TIME"})
+    else:
+        offset = timedelta(minutes=-(alarm.minutes_before or 0))
+        valarm.add("trigger", offset, parameters={"RELATED": "END"})
+    return valarm
+
+
+def _set_todo_alarms(todo: Any, alarms: list[ReminderAlarm], summary: str) -> None:
+    """Replace all ``VALARM`` subcomponents of a VTODO with ``alarms``."""
+    todo.subcomponents = [c for c in todo.subcomponents if c.name != "VALARM"]
+    for alarm in alarms:
+        todo.add_component(_make_valarm(alarm, summary))
+
+
+def _parse_alarms(todo: Any) -> list[ReminderAlarm]:
+    """Parse a VTODO's ``VALARM`` subcomponents into :class:`ReminderAlarm`."""
+    alarms: list[ReminderAlarm] = []
+    for comp in todo.subcomponents:
+        if comp.name != "VALARM":
+            continue
+        trigger_prop = comp.get("trigger")
+        if trigger_prop is None:
+            continue
+        value = trigger_prop.dt
+        if isinstance(value, datetime):
+            alarms.append(ReminderAlarm(trigger=_ensure_aware(value)))
+        elif isinstance(value, timedelta):
+            minutes_before = int(round(-value.total_seconds() / 60))
+            alarms.append(ReminderAlarm(minutes_before=minutes_before))
+    return alarms
 
 
 def _parse_ics_todo(data: str, list_name: str, href: str, etag: str | None) -> Reminder | None:

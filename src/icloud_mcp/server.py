@@ -12,7 +12,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from icloud_mcp.caldav_client import CalDAVClient
 from icloud_mcp.config import get_settings
 from icloud_mcp.imap_client import IMAPClient, IMAPConnectionPool
-from icloud_mcp.models import SearchQuery
+from icloud_mcp.models import ReminderAlarm, SearchQuery
 from icloud_mcp.rules import RulesEngine
 from icloud_mcp.smtp_client import SMTPClient
 
@@ -417,6 +417,24 @@ def _parse_datetime(value: str, field: str) -> datetime:
         ) from exc
 
 
+def _parse_alarms_arg(
+    alarms: list[dict[str, Any]] | None,
+) -> list[ReminderAlarm] | None:
+    """Convert raw alarm dicts (minutes_before / trigger ISO string) into models."""
+    if alarms is None:
+        return None
+    parsed: list[ReminderAlarm] = []
+    for alarm in alarms:
+        trigger = alarm.get("trigger")
+        parsed.append(
+            ReminderAlarm(
+                minutes_before=alarm.get("minutes_before"),
+                trigger=_parse_datetime(trigger, "trigger") if trigger else None,
+            )
+        )
+    return parsed
+
+
 @mcp.tool()
 async def list_calendars(ctx: Context) -> list[dict[str, Any]]:  # type: ignore[type-arg]
     """List all iCloud calendars that support events."""
@@ -684,6 +702,7 @@ async def create_reminder(
     description: str | None = None,
     url: str | None = None,
     rrule: str | None = None,
+    alarms: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Create a reminder in a list, with or without a due date.
 
@@ -698,6 +717,8 @@ async def create_reminder(
         url: Optional associated URL.
         rrule: Optional iCalendar recurrence rule for a recurring task,
             e.g. "FREQ=WEEKLY;BYDAY=MO" or "FREQ=DAILY;COUNT=10".
+        alarms: Optional display alarms. Each item is a dict with exactly one of
+            "minutes_before" (int, before the due) or "trigger" (absolute ISO 8601).
     """
     app = _get_ctx(ctx)
     reminder = await app.caldav_client.create_reminder(
@@ -710,6 +731,7 @@ async def create_reminder(
         description=description,
         url=url,
         rrule=rrule,
+        alarms=_parse_alarms_arg(alarms),
     )
     return reminder.model_dump(mode="json")
 
@@ -727,6 +749,7 @@ async def update_reminder(
     description: str | None = None,
     url: str | None = None,
     rrule: str | None = None,
+    alarms: list[dict[str, Any]] | None = None,
     clear: list[str] | None = None,
 ) -> dict[str, Any]:
     """Update fields of an existing reminder. Only provided fields change.
@@ -736,6 +759,9 @@ async def update_reminder(
     Args:
         rrule: None keeps the current recurrence; "" removes it; a non-empty
             value replaces the recurrence rule.
+        alarms: None keeps the current alarms; any list (including []) replaces
+            all alarms. Each item is a dict with exactly one of "minutes_before"
+            (int) or "trigger" (absolute ISO 8601).
         clear: Field names to unset entirely (any of "due", "start",
             "description", "url", "priority") — e.g. to remove a deadline.
     """
@@ -751,6 +777,7 @@ async def update_reminder(
         description=description,
         url=url,
         rrule=rrule,
+        alarms=_parse_alarms_arg(alarms),
         clear=clear,
     )
     return reminder.model_dump(mode="json")

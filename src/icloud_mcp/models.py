@@ -1,5 +1,9 @@
 """Pydantic data models shared across icloud_mcp modules."""
 
+# ``Reminder.list`` shadows the builtin ``list`` inside that class body, so the
+# ``alarms`` field can't reference ``list[...]`` directly — it would resolve to
+# the field. Alias the builtin here so the annotation/default stay correct.
+from builtins import list as _list
 from datetime import date, datetime
 from typing import Literal
 
@@ -248,6 +252,21 @@ class ReminderList(BaseModel):
     read_only: bool = False
 
 
+class ReminderAlarm(BaseModel):
+    """A display alarm on a reminder (a ``VALARM`` component).
+
+    Exactly one of the two fields is set:
+
+    Attributes:
+        minutes_before: Minutes before the reminder's ``due`` (or ``start`` if
+            there is no due) to fire — a relative ``TRIGGER``.
+        trigger: Absolute date/time to fire — an absolute ``TRIGGER``.
+    """
+
+    minutes_before: int | None = None
+    trigger: datetime | None = None
+
+
 class Reminder(BaseModel):
     """Represents a single reminder/task (a ``VTODO`` component).
 
@@ -276,6 +295,7 @@ class Reminder(BaseModel):
         is_recurring: ``True`` when the task carries an ``RRULE`` (or ``RDATE``).
             For recurring tasks, ``due`` reflects the **next occurrence** when
             surfaced via ``list_reminders``/``search_reminders``.
+        alarms: Display alarms on the task (``VALARM`` components).
         created: Creation timestamp (``CREATED``), if advertised by the server.
         modified: Last-modification timestamp (``LAST-MODIFIED``), if any.
         href: CalDAV resource path of the reminder (``list.url`` + ``UID.ics``).
@@ -295,6 +315,7 @@ class Reminder(BaseModel):
     url: str | None = None
     rrule: str | None = None
     is_recurring: bool = False
+    alarms: _list[ReminderAlarm] = Field(default_factory=_list)
     created: datetime | None = None
     modified: datetime | None = None
     href: str | None = None
