@@ -9,10 +9,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from icloud_mail_mcp.models import Email, Rule, RuleAction, RuleCondition
+from icloud_mcp.models import Email, Rule, RuleAction, RuleCondition
 
 if TYPE_CHECKING:
-    from icloud_mail_mcp.imap_client import IMAPClient
+    from icloud_mcp.imap_client import IMAPClient
 
 log = logging.getLogger(__name__)
 
@@ -25,15 +25,15 @@ class RulesEngine:
     """Manages email filtering rules stored in a local JSON file.
 
     Rules are persisted at ``<rules_dir>/rules.json``.  The default directory
-    is ``~/.icloud_mail_mcp``, but a custom path can be injected for testing.
+    is ``~/.icloud_mcp``, but a custom path can be injected for testing.
 
     Args:
         rules_dir: Directory where ``rules.json`` is stored.  Defaults to
-            ``~/.icloud_mail_mcp``.
+            ``~/.icloud_mcp``.
     """
 
     def __init__(self, rules_dir: Path | None = None) -> None:
-        self._rules_file = (rules_dir or Path.home() / ".icloud_mail_mcp") / "rules.json"
+        self._rules_file = (rules_dir or Path.home() / ".icloud_mcp") / "rules.json"
         self._rules: list[Rule] = []
         self._load_rules()
 

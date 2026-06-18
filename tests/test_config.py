@@ -3,7 +3,7 @@
 import pytest
 from pydantic import ValidationError
 
-from icloud_mail_mcp.config import ICloudMailSettings
+from icloud_mcp.config import ICloudMailSettings
 
 
 @pytest.fixture(autouse=True)

@@ -5,7 +5,7 @@ from datetime import datetime
 import pytest
 from pydantic import ValidationError
 
-from icloud_mail_mcp.models import Email, Folder, RuleAction, RuleCondition, SearchQuery
+from icloud_mcp.models import Email, Folder, RuleAction, RuleCondition, SearchQuery
 
 
 def test_email_defaults() -> None:

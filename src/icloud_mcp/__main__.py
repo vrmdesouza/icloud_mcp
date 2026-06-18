@@ -1,8 +1,8 @@
-"""Entry point for the iCloud Mail MCP server."""
+"""Entry point for the iCloud MCP server."""
 
 import logging
 
-from icloud_mail_mcp.server import mcp
+from icloud_mcp.server import mcp
 
 logging.basicConfig(
     level=logging.INFO,

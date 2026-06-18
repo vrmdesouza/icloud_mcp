@@ -8,16 +8,16 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from icloud_mail_mcp.config import ICloudMailSettings
-from icloud_mail_mcp.exceptions import IMAPAuthenticationError, IMAPConnectionError
-from icloud_mail_mcp.imap_client import (
+from icloud_mcp.config import ICloudMailSettings
+from icloud_mcp.exceptions import IMAPAuthenticationError, IMAPConnectionError
+from icloud_mcp.imap_client import (
     IMAPClient,
     IMAPConnectionPool,
     _build_search_criteria,
     _decode_header,
     _validate_uid,
 )
-from icloud_mail_mcp.models import EmailListResult, FolderStats, SearchQuery
+from icloud_mcp.models import EmailListResult, FolderStats, SearchQuery
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Local fixture
@@ -30,8 +30,8 @@ async def imap_client_and_conn(
     mock_imap_conn: AsyncMock,
 ) -> AsyncGenerator[tuple[IMAPClient, AsyncMock], None]:
     """Initialized IMAPClient backed by a fully mocked connection pool."""
-    with patch("icloud_mail_mcp.imap_client.IMAP4_SSL", return_value=mock_imap_conn):
-        with patch("icloud_mail_mcp.imap_client.RETRY_DELAYS", (0.0, 0.0, 0.0)):
+    with patch("icloud_mcp.imap_client.IMAP4_SSL", return_value=mock_imap_conn):
+        with patch("icloud_mcp.imap_client.RETRY_DELAYS", (0.0, 0.0, 0.0)):
             pool = IMAPConnectionPool(settings)
             await pool.initialize()
             client = IMAPClient(pool)
@@ -46,8 +46,8 @@ async def imap_client_and_conn(
 
 async def test_pool_init(settings: ICloudMailSettings, mock_imap_conn: AsyncMock) -> None:
     """initialize() creates pool_size connections and fills the internal queue."""
-    with patch("icloud_mail_mcp.imap_client.IMAP4_SSL", return_value=mock_imap_conn):
-        with patch("icloud_mail_mcp.imap_client.RETRY_DELAYS", (0.0, 0.0, 0.0)):
+    with patch("icloud_mcp.imap_client.IMAP4_SSL", return_value=mock_imap_conn):
+        with patch("icloud_mcp.imap_client.RETRY_DELAYS", (0.0, 0.0, 0.0)):
             pool = IMAPConnectionPool(settings)
             await pool.initialize()
             assert mock_imap_conn.login.call_count == settings.imap_pool_size
@@ -57,7 +57,7 @@ async def test_pool_init(settings: ICloudMailSettings, mock_imap_conn: AsyncMock
 
 async def test_pool_acquire(settings: ICloudMailSettings, mock_imap_conn: AsyncMock) -> None:
     """acquire() yields a connection, shrinks the queue, then restores it on exit."""
-    with patch("icloud_mail_mcp.imap_client.IMAP4_SSL", return_value=mock_imap_conn):
+    with patch("icloud_mcp.imap_client.IMAP4_SSL", return_value=mock_imap_conn):
         pool = IMAPConnectionPool(settings)
         await pool.initialize()
         initial_size = pool._queue.qsize()
@@ -94,8 +94,8 @@ async def test_pool_acquire_stale_reconnects(
     )
 
     # First IMAP4_SSL() call (initialize) → stale_conn; second (reconnect) → fresh_conn
-    with patch("icloud_mail_mcp.imap_client.IMAP4_SSL", side_effect=[stale_conn, fresh_conn]):
-        with patch("icloud_mail_mcp.imap_client.RETRY_DELAYS", (0.0, 0.0, 0.0)):
+    with patch("icloud_mcp.imap_client.IMAP4_SSL", side_effect=[stale_conn, fresh_conn]):
+        with patch("icloud_mcp.imap_client.RETRY_DELAYS", (0.0, 0.0, 0.0)):
             pool = IMAPConnectionPool(local_settings)
             await pool.initialize()
 
@@ -110,7 +110,7 @@ async def test_pool_acquire_stale_reconnects(
 
 async def test_pool_close(settings: ICloudMailSettings, mock_imap_conn: AsyncMock) -> None:
     """close() logs out every connection and empties the queue."""
-    with patch("icloud_mail_mcp.imap_client.IMAP4_SSL", return_value=mock_imap_conn):
+    with patch("icloud_mcp.imap_client.IMAP4_SSL", return_value=mock_imap_conn):
         pool = IMAPConnectionPool(settings)
         await pool.initialize()
         await pool.close()
@@ -125,7 +125,7 @@ async def test_pool_close(settings: ICloudMailSettings, mock_imap_conn: AsyncMoc
 
 async def test_retry_success_on_second(settings: ICloudMailSettings) -> None:
     """Operation that fails once then succeeds returns value; sleep called once."""
-    with patch("icloud_mail_mcp.imap_client.RETRY_DELAYS", (0.0, 0.0, 0.0)):
+    with patch("icloud_mcp.imap_client.RETRY_DELAYS", (0.0, 0.0, 0.0)):
         with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
             pool = IMAPConnectionPool(settings)
             call_count = 0
@@ -144,7 +144,7 @@ async def test_retry_success_on_second(settings: ICloudMailSettings) -> None:
 
 async def test_retry_exhaustion(settings: ICloudMailSettings) -> None:
     """Function that always fails raises IMAPConnectionError after all retries."""
-    with patch("icloud_mail_mcp.imap_client.RETRY_DELAYS", (0.0, 0.0, 0.0)):
+    with patch("icloud_mcp.imap_client.RETRY_DELAYS", (0.0, 0.0, 0.0)):
         with patch("asyncio.sleep", new_callable=AsyncMock):
             pool = IMAPConnectionPool(settings)
 
@@ -157,7 +157,7 @@ async def test_retry_exhaustion(settings: ICloudMailSettings) -> None:
 
 async def test_auth_failure_no_retry(settings: ICloudMailSettings) -> None:
     """IMAPAuthenticationError propagates immediately without any retry sleep."""
-    with patch("icloud_mail_mcp.imap_client.RETRY_DELAYS", (0.0, 0.0, 0.0)):
+    with patch("icloud_mcp.imap_client.RETRY_DELAYS", (0.0, 0.0, 0.0)):
         with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
             pool = IMAPConnectionPool(settings)
 
@@ -1328,7 +1328,7 @@ async def test_create_connection_wraps_oserror(
 ) -> None:
     """_create_connection wraps OSError into IMAPConnectionError."""
     with patch(
-        "icloud_mail_mcp.imap_client.IMAP4_SSL",
+        "icloud_mcp.imap_client.IMAP4_SSL",
         side_effect=OSError("Connection refused"),
     ):
         pool = IMAPConnectionPool(settings)

@@ -1,4 +1,4 @@
-"""Shared test fixtures for icloud_mail_mcp tests."""
+"""Shared test fixtures for icloud_mcp tests."""
 
 from collections.abc import Callable, Generator
 from email import encoders
@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from icloud_mail_mcp.config import ICloudMailSettings, get_settings
+from icloud_mcp.config import ICloudMailSettings, get_settings
 
 
 @pytest.fixture(autouse=True)

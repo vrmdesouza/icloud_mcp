@@ -1,4 +1,4 @@
-"""Configuration loading and validation for the iCloud Mail MCP server.
+"""Configuration loading and validation for the iCloud MCP server.
 
 Reads settings from environment variables (or a .env file) using pydantic-settings.
 Fails fast at startup if required variables are missing.
@@ -19,6 +19,10 @@ class ICloudMailSettings(BaseSettings):
     Optional variables:
         IMAP_POOL_SIZE: Number of persistent IMAP connections to maintain (default 3).
         IMAP_TIMEOUT: Timeout in seconds for IMAP operations (default 30).
+        CALDAV_TIMEOUT: Timeout in seconds for CalDAV (Calendar) operations (default 30).
+
+    The same App-Specific Password is used for Mail (IMAP/SMTP) and
+    Calendar (CalDAV) — Apple shares the credential across both services.
 
     Example:
         settings = ICloudMailSettings()
@@ -31,6 +35,7 @@ class ICloudMailSettings(BaseSettings):
     icloud_app_password: str
     imap_pool_size: int = 3
     imap_timeout: int = 30
+    caldav_timeout: int = 30
 
     @property
     def imap_host(self) -> str:
@@ -51,6 +56,15 @@ class ICloudMailSettings(BaseSettings):
     def smtp_port(self) -> int:
         """SMTP server port (STARTTLS)."""
         return 587
+
+    @property
+    def caldav_url(self) -> str:
+        """Bootstrap CalDAV URL for iCloud service discovery.
+
+        The actual calendar-home-set lives on a per-account partition host
+        (e.g. ``https://p67-caldav.icloud.com``) discovered at runtime.
+        """
+        return "https://caldav.icloud.com"
 
 
 @lru_cache(maxsize=1)

@@ -5,8 +5,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from icloud_mail_mcp.models import Email, EmailListResult
-from icloud_mail_mcp.rules import RulesEngine
+from icloud_mcp.models import Email, EmailListResult
+from icloud_mcp.rules import RulesEngine
 
 # ------------------------------------------------------------------
 # Fixtures

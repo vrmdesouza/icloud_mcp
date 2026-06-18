@@ -13,9 +13,9 @@ from email.message import EmailMessage
 
 import aiosmtplib
 
-from icloud_mail_mcp.config import ICloudMailSettings
-from icloud_mail_mcp.exceptions import SMTPSendError
-from icloud_mail_mcp.models import Email
+from icloud_mcp.config import ICloudMailSettings
+from icloud_mcp.exceptions import SMTPSendError
+from icloud_mcp.models import Email
 
 log = logging.getLogger(__name__)
 
