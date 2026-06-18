@@ -653,3 +653,134 @@ async def test_update_event_keeps_recurrence_when_rrule_omitted() -> None:
     assert event.is_recurring is True
     assert b"RRULE:FREQ=WEEKLY;BYDAY=MO" in captured["body"]
     await client.close()
+
+
+# -- recurrence: editing/deleting a single occurrence ----------------------
+
+
+def _occurrence_handler(ics: str, captured: dict[str, str]) -> Handler:
+    """Serve ``ics`` for any REPORT and capture the PUT body."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        disc = _discovery(request)
+        if disc is not None:
+            return disc
+        if request.method == "REPORT":
+            return httpx.Response(207, content=_events_multistatus(_raw_event_response(ics)))
+        if request.method == "PUT":
+            captured["body"] = request.content.decode()
+            return httpx.Response(201, headers={"ETag": '"etag-new"'})
+        return httpx.Response(500, text="unexpected")
+
+    return handler
+
+
+_OVERRIDE_0615 = (
+    "BEGIN:VEVENT\r\nUID:weekly-1\r\nSUMMARY:Standup (old override)\r\n"
+    "RECURRENCE-ID:20260615T090000Z\r\n"
+    "DTSTART:20260615T093000Z\r\nDTEND:20260615T100000Z\r\nEND:VEVENT\r\n"
+)
+_ALLDAY_WEEKLY = (
+    "BEGIN:VEVENT\r\nUID:weekly-1\r\nSUMMARY:Daily walk\r\n"
+    "DTSTART;VALUE=DATE:20260601\r\nDTEND;VALUE=DATE:20260602\r\n"
+    "RRULE:FREQ=WEEKLY;BYDAY=MO\r\nEND:VEVENT\r\n"
+)
+_SIMPLE_VEVENT = (
+    "BEGIN:VEVENT\r\nUID:simple-1\r\nSUMMARY:One off\r\n"
+    "DTSTART:20260610T120000Z\r\nDTEND:20260610T130000Z\r\nEND:VEVENT\r\n"
+)
+
+
+async def test_update_occurrence_adds_override() -> None:
+    captured: dict[str, str] = {}
+    client = _make_client(_occurrence_handler(_ics(WEEKLY_VEVENT), captured))
+    event = await client.update_occurrence(
+        "Work",
+        "weekly-1",
+        datetime(2026, 6, 15, 9, tzinfo=UTC),
+        summary="Moved",
+        start=datetime(2026, 6, 15, 11, tzinfo=UTC),
+    )
+    assert event.summary == "Moved"
+    assert event.start == datetime(2026, 6, 15, 11, tzinfo=UTC)
+    assert event.is_recurring is True
+    assert event.recurrence_id == datetime(2026, 6, 15, 9, tzinfo=UTC)
+    body = captured["body"]
+    assert "RECURRENCE-ID:20260615T090000Z" in body
+    assert "SUMMARY:Moved" in body
+    assert "RRULE:FREQ=WEEKLY;BYDAY=MO" in body  # master rule untouched
+    await client.close()
+
+
+async def test_update_occurrence_updates_existing_override() -> None:
+    captured: dict[str, str] = {}
+    client = _make_client(_occurrence_handler(_ics(WEEKLY_VEVENT, _OVERRIDE_0615), captured))
+    await client.update_occurrence(
+        "Work", "weekly-1", datetime(2026, 6, 15, 9, tzinfo=UTC), summary="Renamed once"
+    )
+    body = captured["body"]
+    # Existing override is updated in place — not duplicated.
+    assert body.count("RECURRENCE-ID:20260615T090000Z") == 1
+    assert "SUMMARY:Renamed once" in body
+    assert "Standup (old override)" not in body
+    await client.close()
+
+
+async def test_delete_occurrence_adds_exdate() -> None:
+    captured: dict[str, str] = {}
+    client = _make_client(_occurrence_handler(_ics(WEEKLY_VEVENT), captured))
+    result = await client.delete_occurrence("Work", "weekly-1", datetime(2026, 6, 8, 9, tzinfo=UTC))
+    assert result["status"] == "deleted_occurrence"
+    assert result["uid"] == "weekly-1"
+    assert "EXDATE:20260608T090000Z" in captured["body"]
+    await client.close()
+
+
+async def test_delete_occurrence_drops_existing_override() -> None:
+    override_0608 = (
+        "BEGIN:VEVENT\r\nUID:weekly-1\r\nSUMMARY:Standup (override)\r\n"
+        "RECURRENCE-ID:20260608T090000Z\r\n"
+        "DTSTART:20260608T100000Z\r\nDTEND:20260608T103000Z\r\nEND:VEVENT\r\n"
+    )
+    captured: dict[str, str] = {}
+    client = _make_client(_occurrence_handler(_ics(WEEKLY_VEVENT, override_0608), captured))
+    await client.delete_occurrence("Work", "weekly-1", datetime(2026, 6, 8, 9, tzinfo=UTC))
+    body = captured["body"]
+    assert "EXDATE:20260608T090000Z" in body
+    assert "RECURRENCE-ID:20260608T090000Z" not in body  # override removed
+    await client.close()
+
+
+async def test_update_occurrence_all_day_uses_date() -> None:
+    captured: dict[str, str] = {}
+    client = _make_client(_occurrence_handler(_ics(_ALLDAY_WEEKLY), captured))
+    await client.update_occurrence(
+        "Work", "weekly-1", datetime(2026, 6, 15, tzinfo=UTC), summary="Long walk"
+    )
+    body = captured["body"]
+    assert "RECURRENCE-ID;VALUE=DATE:20260615" in body
+    assert "DTSTART;VALUE=DATE:20260615" in body
+    await client.close()
+
+
+async def test_update_occurrence_on_non_recurring_raises() -> None:
+    captured: dict[str, str] = {}
+    client = _make_client(_occurrence_handler(_ics(_SIMPLE_VEVENT), captured))
+    with pytest.raises(CalDAVError, match="não é uma série recorrente"):
+        await client.update_occurrence(
+            "Work", "simple-1", datetime(2026, 6, 10, 12, tzinfo=UTC), summary="x"
+        )
+    assert "body" not in captured  # nothing written
+    await client.close()
+
+
+async def test_update_occurrence_unknown_slot_raises() -> None:
+    captured: dict[str, str] = {}
+    client = _make_client(_occurrence_handler(_ics(WEEKLY_VEVENT), captured))
+    # 2026-06-10 is a Wednesday — not a slot of a Monday weekly series.
+    with pytest.raises(CalDAVError, match="não existe na série"):
+        await client.update_occurrence(
+            "Work", "weekly-1", datetime(2026, 6, 10, 9, tzinfo=UTC), summary="x"
+        )
+    assert "body" not in captured
+    await client.close()

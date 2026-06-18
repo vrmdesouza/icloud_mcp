@@ -172,13 +172,16 @@ class CalDAVAuthenticationError(CalDAVError): ...
 | `create_event` | `calendar: str`, `summary: str`, `start: str`, `end: str`, `all_day: bool = False`, `location: str?`, `description: str?`, `rrule: str?` | `CalendarEvent` | Create a new event; pass `rrule` for a recurring series |
 | `update_event` | `calendar: str`, `uid: str`, + optional `summary`/`start`/`end`/`all_day`/`location`/`description`/`rrule` | `CalendarEvent` | Update the provided fields (whole series). `rrule=""` removes recurrence |
 | `delete_event` | `calendar: str`, `uid: str` | `dict` | Delete an event/series by UID |
+| `update_occurrence` | `calendar: str`, `uid: str`, `recurrence_id: str`, + optional `summary`/`start`/`end`/`location`/`description` | `CalendarEvent` | Edit a **single occurrence** of a series (adds a `RECURRENCE-ID` override) |
+| `delete_occurrence` | `calendar: str`, `uid: str`, `recurrence_id: str` | `dict` | Delete a **single occurrence** of a series (adds an `EXDATE`) |
 
 #### Recurrence
 
 iCloud's server-side `expand` is unreliable, so recurrence is expanded **client-side** with `recurring-ical-events`:
 - `list_events` expands `RRULE`/`RDATE`/`EXDATE`/`RECURRENCE-ID` into concrete occurrences within the requested window (each carries `recurrence_id`, `is_recurring=True`). Expansion always requires a finite window.
 - `get_event` returns the **series master** with its `rrule` preserved — it does not expand.
-- `create_event`/`update_event` accept a raw `rrule` (e.g. `"FREQ=WEEKLY;BYDAY=MO"`), validated before the `PUT`. **Scope: whole series only.** Editing/deleting a single occurrence (`RECURRENCE-ID`/`EXDATE`) is intentionally out of scope.
+- `create_event`/`update_event` accept a raw `rrule` (e.g. `"FREQ=WEEKLY;BYDAY=MO"`), validated before the `PUT`. They operate on the **whole series**.
+- **Single occurrence**: `update_occurrence` adds/updates a `RECURRENCE-ID` override inside the same resource; `delete_occurrence` adds an `EXDATE` to the master (and drops any override for that slot). Both address the occurrence by `recurrence_id` (the original slot, as returned by `list_events`), validate it against the series, and PUT the whole resource with `If-Match`. The `RECURRENCE-ID`/`EXDATE` value type (date vs datetime) is derived from the master's `DTSTART`. **Out of scope:** "this and future" (`THISANDFUTURE`).
 
 ### Pagination (`list_emails`)
 

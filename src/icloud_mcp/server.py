@@ -532,6 +532,68 @@ async def update_event(
 
 @mcp.tool()
 async def delete_event(ctx: Context, calendar: str, uid: str) -> dict[str, str]:  # type: ignore[type-arg]
-    """Delete a calendar event by its iCalendar UID."""
+    """Delete a calendar event by its iCalendar UID (the whole series if recurring)."""
     app = _get_ctx(ctx)
     return await app.caldav_client.delete_event(calendar=calendar, uid=uid)
+
+
+@mcp.tool()
+async def update_occurrence(
+    ctx: Context,  # type: ignore[type-arg]
+    calendar: str,
+    uid: str,
+    recurrence_id: str,
+    summary: str | None = None,
+    start: str | None = None,
+    end: str | None = None,
+    location: str | None = None,
+    description: str | None = None,
+) -> dict[str, Any]:
+    """Edit a single occurrence of a recurring series, leaving the rest intact.
+
+    Args:
+        calendar: Calendar display name.
+        uid: UID of the recurring series.
+        recurrence_id: The occurrence's original slot (ISO 8601), as returned in
+            each occurrence's `recurrence_id` by `list_events`.
+        summary: New title for this occurrence only.
+        start: New start (ISO 8601) for this occurrence only.
+        end: New end (ISO 8601) for this occurrence only.
+        location: New location for this occurrence only.
+        description: New notes for this occurrence only.
+    """
+    app = _get_ctx(ctx)
+    event = await app.caldav_client.update_occurrence(
+        calendar=calendar,
+        uid=uid,
+        recurrence_id=_parse_datetime(recurrence_id, "recurrence_id"),
+        summary=summary,
+        start=_parse_datetime(start, "start") if start is not None else None,
+        end=_parse_datetime(end, "end") if end is not None else None,
+        location=location,
+        description=description,
+    )
+    return event.model_dump(mode="json")
+
+
+@mcp.tool()
+async def delete_occurrence(
+    ctx: Context,  # type: ignore[type-arg]
+    calendar: str,
+    uid: str,
+    recurrence_id: str,
+) -> dict[str, str]:
+    """Delete a single occurrence of a recurring series (keeps the rest).
+
+    Args:
+        calendar: Calendar display name.
+        uid: UID of the recurring series.
+        recurrence_id: The occurrence's original slot (ISO 8601), as returned in
+            each occurrence's `recurrence_id` by `list_events`.
+    """
+    app = _get_ctx(ctx)
+    return await app.caldav_client.delete_occurrence(
+        calendar=calendar,
+        uid=uid,
+        recurrence_id=_parse_datetime(recurrence_id, "recurrence_id"),
+    )

@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from xml.etree import ElementTree as ET
 
@@ -347,24 +347,134 @@ class CalDAVClient:
         await self._request("DELETE", existing.href, headers=headers)
         return {"status": "deleted", "uid": uid}
 
+    async def update_occurrence(
+        self,
+        calendar: str,
+        uid: str,
+        recurrence_id: datetime,
+        summary: str | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        location: str | None = None,
+        description: str | None = None,
+    ) -> CalendarEvent:
+        """Edit a single occurrence of a recurring series.
+
+        Adds (or updates) a ``RECURRENCE-ID`` override inside the same resource,
+        leaving the master rule and the other occurrences untouched. The whole
+        resource is PUT back with ``If-Match``.
+
+        Args:
+            recurrence_id: The original slot of the occurrence to edit, as
+                returned in ``CalendarEvent.recurrence_id`` by ``list_events``.
+
+        Raises:
+            CalDAVError: If the series is not recurring or the slot does not exist.
+        """
+        cal = await self._resolve_calendar(calendar)
+        cal_obj, href, etag = await self._fetch_resource(cal, uid)
+        master = _require_recurring_master(cal_obj, uid)
+        all_day = not isinstance(master.get("dtstart").dt, datetime)
+        rid_value = _recurrence_id_value(master, recurrence_id)
+        if not _slot_in_series(cal_obj, rid_value):
+            raise CalDAVError(
+                f"Ocorrência '{recurrence_id.isoformat()}' não existe na série '{uid}'."
+            )
+        override = _find_override(cal_obj, rid_value)
+        if override is None:
+            override = _new_override(master, rid_value)
+            cal_obj.add_component(override)
+        _apply_occurrence_fields(
+            override,
+            all_day=all_day,
+            summary=summary,
+            start=start,
+            end=end,
+            location=location,
+            description=description,
+        )
+        new_etag = await self._put_resource(href, cal_obj, etag)
+        event = _component_to_event(
+            override,
+            cal.name,
+            href,
+            new_etag,
+            rrule=master.get("rrule").to_ical().decode(),
+            is_recurring=True,
+            recurrence_id=recurrence_id,
+        )
+        if event is None:  # override always has DTSTART; defensive for the type checker
+            raise CalDAVError(f"Falha ao montar a ocorrência editada da série '{uid}'.")
+        return event
+
+    async def delete_occurrence(
+        self, calendar: str, uid: str, recurrence_id: datetime
+    ) -> dict[str, str]:
+        """Delete a single occurrence of a recurring series via ``EXDATE``.
+
+        Adds the slot to the master's ``EXDATE`` (and drops any override for
+        that slot), then PUTs the whole resource back. The series and all other
+        occurrences are preserved.
+        """
+        cal = await self._resolve_calendar(calendar)
+        cal_obj, href, etag = await self._fetch_resource(cal, uid)
+        master = _require_recurring_master(cal_obj, uid)
+        rid_value = _recurrence_id_value(master, recurrence_id)
+        if not _slot_in_series(cal_obj, rid_value):
+            raise CalDAVError(
+                f"Ocorrência '{recurrence_id.isoformat()}' não existe na série '{uid}'."
+            )
+        override = _find_override(cal_obj, rid_value)
+        if override is not None:
+            cal_obj.subcomponents.remove(override)
+        master.add("exdate", rid_value)
+        await self._put_resource(href, cal_obj, etag)
+        return {
+            "status": "deleted_occurrence",
+            "uid": uid,
+            "recurrence_id": recurrence_id.isoformat(),
+        }
+
+    async def _put_resource(self, href: str, cal_obj: Any, etag: str | None) -> str | None:
+        """PUT a whole VCALENDAR resource back, with optimistic ``If-Match``."""
+        headers = {"Content-Type": "text/calendar; charset=utf-8"}
+        if etag:
+            headers["If-Match"] = etag
+        resp = await self._request("PUT", href, content=cal_obj.to_ical(), headers=headers)
+        return _strip_etag(resp.headers.get("ETag")) or etag
+
     # -- internal helpers --------------------------------------------------
 
     async def _find_event(self, calendar: str, uid: str) -> CalendarEvent | None:
         cal = await self._resolve_calendar(calendar)
-        body = (
-            '<c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">'
-            "<d:prop><d:getetag/><c:calendar-data/></d:prop>"
-            '<c:filter><c:comp-filter name="VCALENDAR">'
-            '<c:comp-filter name="VEVENT">'
-            f'<c:prop-filter name="UID">'
-            f'<c:text-match collation="i;octet">{_xml_escape(uid)}</c:text-match>'
-            "</c:prop-filter>"
-            "</c:comp-filter></c:comp-filter></c:filter>"
-            "</c:calendar-query>"
-        )
-        root = await self._report(cal.url, body, depth="1")
+        root = await self._report(cal.url, _uid_query_body(uid), depth="1")
         events = self._parse_event_responses(root, cal, window=None)
         return events[0] if events else None
+
+    async def _fetch_resource(self, cal: Calendar, uid: str) -> tuple[Any, str, str | None]:
+        """Fetch the raw VCALENDAR resource (master + overrides) for a series.
+
+        Returns ``(icalendar_calendar, full_href, etag)``. Unlike ``get_event``,
+        this preserves the entire resource — needed to add overrides/EXDATE.
+
+        Raises:
+            CalDAVError: If no resource with the given UID exists.
+        """
+        root = await self._report(cal.url, _uid_query_body(uid), depth="1")
+        for resp in root.findall("d:response", _NS):
+            href = _text(resp.find("d:href", _NS))
+            propstat = _ok_propstat(resp)
+            if href is None or propstat is None:
+                continue
+            data = _text(propstat.find("d:prop/c:calendar-data", _NS))
+            if not data:
+                continue
+            etag = _strip_etag(_text(propstat.find("d:prop/d:getetag", _NS)))
+            ical = _safe_parse(data, href)
+            if ical is None:
+                continue
+            return ical, str(httpx.URL(cal.url).join(href)), etag
+        raise CalDAVError(f"Evento com UID '{uid}' não encontrado no calendário '{cal.name}'.")
 
     def _parse_event_responses(
         self,
@@ -527,6 +637,21 @@ def _xml_escape(value: str) -> str:
     return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def _uid_query_body(uid: str) -> str:
+    """Build a calendar-query REPORT body filtering VEVENTs by UID."""
+    return (
+        '<c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">'
+        "<d:prop><d:getetag/><c:calendar-data/></d:prop>"
+        '<c:filter><c:comp-filter name="VCALENDAR">'
+        '<c:comp-filter name="VEVENT">'
+        f'<c:prop-filter name="UID">'
+        f'<c:text-match collation="i;octet">{_xml_escape(uid)}</c:text-match>'
+        "</c:prop-filter>"
+        "</c:comp-filter></c:comp-filter></c:filter>"
+        "</c:calendar-query>"
+    )
+
+
 def _caldav_dt(value: datetime) -> str:
     """Format a datetime as a UTC CalDAV time-range bound (YYYYMMDDTHHMMSSZ)."""
     if value.tzinfo is None:
@@ -596,6 +721,128 @@ def _build_vevent(
 
 def _ensure_aware(value: datetime) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
+# -- single-occurrence editing helpers -------------------------------------
+
+
+def _require_recurring_master(cal_obj: Any, uid: str) -> Any:
+    """Return the series master VEVENT, or raise if not a recurring series."""
+    master = _master_component(cal_obj)
+    if master is None or master.get("rrule") is None:
+        raise CalDAVError(f"Evento '{uid}' não é uma série recorrente.")
+    return master
+
+
+def _as_dt(value: date | datetime) -> datetime:
+    """Normalize a date or datetime to an aware datetime (for comparison)."""
+    if isinstance(value, datetime):
+        return _ensure_aware(value)
+    return datetime(value.year, value.month, value.day, tzinfo=UTC)
+
+
+def _same_moment(a: date | datetime, b: date | datetime) -> bool:
+    """Whether two RECURRENCE-ID values point at the same instant."""
+    return _as_dt(a) == _as_dt(b)
+
+
+def _recurrence_id_value(master: Any, recurrence_id: datetime) -> date | datetime:
+    """Type the RECURRENCE-ID/EXDATE value to match the master's DTSTART kind."""
+    dtstart = master.get("dtstart").dt
+    if isinstance(dtstart, datetime):
+        return _ensure_aware(recurrence_id)
+    return recurrence_id.date()
+
+
+def _master_duration(master: Any) -> timedelta:
+    """Duration of the master event (used to default a new override's end)."""
+    dtstart = master.get("dtstart").dt
+    dtend_prop = master.get("dtend")
+    if dtend_prop is None:
+        return timedelta(0)
+    return _as_dt(dtend_prop.dt) - _as_dt(dtstart)
+
+
+def _find_override(cal_obj: Any, rid_value: date | datetime) -> Any:
+    """Find an existing override VEVENT for the given recurrence slot."""
+    for comp in cal_obj.walk("VEVENT"):
+        rid = comp.get("recurrence-id")
+        if rid is not None and _same_moment(rid.dt, rid_value):
+            return comp
+    return None
+
+
+def _slot_in_series(cal_obj: Any, rid_value: date | datetime) -> bool:
+    """Validate that ``rid_value`` is a real occurrence of the series."""
+    anchor = _as_dt(rid_value)
+    try:
+        occurrences = recurring_ical_events.of(cal_obj).between(
+            anchor - timedelta(days=2), anchor + timedelta(days=2)
+        )
+    except Exception:  # noqa: BLE001 — never block a write on an expansion hiccup
+        return True
+    for occ in occurrences:
+        rid = occ.get("recurrence-id")
+        if rid is not None and _same_moment(rid.dt, rid_value):
+            return True
+    return False
+
+
+def _new_override(master: Any, rid_value: date | datetime) -> Any:
+    """Build a fresh override VEVENT seeded from the master at ``rid_value``."""
+    duration = _master_duration(master)
+    override = IEvent()
+    override.add("uid", master.get("uid"))
+    override.add("recurrence-id", rid_value)
+    override.add("dtstamp", datetime.now(UTC))
+    override.add("summary", str(master.get("summary", "")))
+    override.add("dtstart", rid_value)
+    override.add("dtend", rid_value + duration)
+    location = master.get("location")
+    description = master.get("description")
+    if location:
+        override.add("location", str(location))
+    if description:
+        override.add("description", str(description))
+    return override
+
+
+def _set_prop(comp: Any, name: str, value: Any) -> None:
+    """Replace a single property on a component (icalendar dict is caseless)."""
+    if name in comp:
+        del comp[name]
+    if value is not None:
+        comp.add(name, value)
+
+
+def _apply_occurrence_fields(
+    override: Any,
+    *,
+    all_day: bool,
+    summary: str | None,
+    start: datetime | None,
+    end: datetime | None,
+    location: str | None,
+    description: str | None,
+) -> None:
+    """Apply the provided field edits onto an override VEVENT in place."""
+    if summary is not None:
+        _set_prop(override, "summary", summary)
+    if location is not None:
+        _set_prop(override, "location", location or None)
+    if description is not None:
+        _set_prop(override, "description", description or None)
+    if start is None and end is None:
+        return
+    duration = _master_duration(override)
+    if start is not None:
+        new_start: date | datetime = start.date() if all_day else _ensure_aware(start)
+        _set_prop(override, "dtstart", new_start)
+        if end is None:
+            _set_prop(override, "dtend", new_start + duration)
+    if end is not None:
+        new_end: date | datetime = end.date() if all_day else _ensure_aware(end)
+        _set_prop(override, "dtend", new_end)
 
 
 def _safe_parse(data: str, href: str) -> Any:
