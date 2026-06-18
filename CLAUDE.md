@@ -193,8 +193,8 @@ iCloud's server-side `expand` is unreliable, so recurrence is expanded **client-
 | `list_reminders` | `list: str`, `include_completed: bool = False` | `list[Reminder]` | Tasks in a list, ordered by `due` (undated last). Hides completed by default |
 | `search_reminders` | `query: str?`, `due_before: str?`, `due_after: str?`, `include_completed: bool = False`, `undated: bool = True`, `lists: list[str]?` | `list[Reminder]` | Search **across all lists** (or a subset), ordered by `due`. Presets: overdue (`due_before=now`, `undated=False`), due today (`due_before`=end of today, `undated=False`), free-text (`query`). Lists fetched concurrently |
 | `get_reminder` | `list: str`, `uid: str` | `Reminder` | Fetch a single reminder by iCalendar UID |
-| `create_reminder` | `list: str`, `summary: str`, `due: str?`, `start: str?`, `all_day: bool = False`, `priority: int?`, `description: str?`, `url: str?` | `Reminder` | Create a task; omit `due` for a task without a deadline |
-| `update_reminder` | `list: str`, `uid: str`, + optional `summary`/`due`/`start`/`all_day`/`priority`/`description`/`url`, `clear: list[str]?` | `Reminder` | Update the provided fields. `clear` unsets fields entirely (`due`/`start`/`description`/`url`/`priority`) — e.g. remove a deadline |
+| `create_reminder` | `list: str`, `summary: str`, `due: str?`, `start: str?`, `all_day: bool = False`, `priority: int?`, `description: str?`, `url: str?`, `rrule: str?` | `Reminder` | Create a task; omit `due` for a task without a deadline. Pass `rrule` for a recurring task |
+| `update_reminder` | `list: str`, `uid: str`, + optional `summary`/`due`/`start`/`all_day`/`priority`/`description`/`url`/`rrule`, `clear: list[str]?` | `Reminder` | Update the provided fields. `rrule=""` removes recurrence. `clear` unsets fields entirely (`due`/`start`/`description`/`url`/`priority`) — e.g. remove a deadline |
 | `complete_reminder` | `list: str`, `uid: str` | `Reminder` | Mark a task completed (`STATUS:COMPLETED`) |
 | `reopen_reminder` | `list: str`, `uid: str` | `Reminder` | Reopen a completed task (`STATUS:NEEDS-ACTION`) |
 | `delete_reminder` | `list: str`, `uid: str` | `dict` | Delete a task by UID |
@@ -203,7 +203,14 @@ iCloud's server-side `expand` is unreliable, so recurrence is expanded **client-
 | `rename_reminder_list` | `name: str`, `new_name: str` | `ReminderList` | Rename a list (`PROPPATCH` of `displayname`) |
 | `delete_reminder_list` | `name: str`, `confirm: bool = False` | `dict` | Delete a list **and all its tasks**; requires `confirm=True` |
 
-`priority` follows iCalendar: 0 = none, 1–4 = high, 5 = medium, 6–9 = low. Recurring reminders are **out of scope for v1** (see the CalDAV decision note above). `created`/`modified` (from `CREATED`/`LAST-MODIFIED`) are exposed read-only on `Reminder`.
+`priority` follows iCalendar: 0 = none, 1–4 = high, 5 = medium, 6–9 = low. `created`/`modified` (from `CREATED`/`LAST-MODIFIED`) are exposed read-only on `Reminder`.
+
+#### Recurring reminders
+
+Unlike events, recurring reminders are **never expanded into many rows** — a recurring task is one `Reminder` carrying its `rrule`/`is_recurring`. Instead:
+- `list_reminders`/`search_reminders` roll a recurring task's `due` forward to its **next occurrence ≥ now** (computed with `dateutil.rrule`; if the rule is exhausted the stored due is kept). `get_reminder` returns the stored master `due` unchanged.
+- `complete_reminder` on a recurring task **advances it to the next occurrence** (`DUE`/`DTSTART` shifted, kept `NEEDS-ACTION`) instead of completing the series — matching task-app behavior. Only when the series is exhausted is it marked `COMPLETED`.
+- **Caveats (best-effort, validate against real iCloud):** advancing re-anchors the rule at the current `due`, so `COUNT`/`UNTIL` semantics are approximate across many completions; the advance-on-complete behavior itself should be confirmed against a live account (iCloud may differ).
 
 ### Pagination (`list_emails`)
 
@@ -260,6 +267,7 @@ testpaths = ["tests"]
 - `httpx` — async HTTP client (CalDAV transport)
 - `icalendar` — build/parse iCalendar (`VEVENT`) documents
 - `recurring-ical-events` — client-side expansion of recurring events (`RRULE`/`EXDATE`/`RECURRENCE-ID`)
+- `python-dateutil` — `rrule` computation for recurring reminders' next occurrence
 - `pydantic-settings` — env var loading with validation
 - `python-dotenv` — `.env` file support in development
 - `ruff`, `mypy`, `pytest`, `pytest-asyncio` — dev dependencies

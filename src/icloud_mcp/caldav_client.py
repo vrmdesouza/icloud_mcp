@@ -21,6 +21,7 @@ from xml.etree import ElementTree as ET
 
 import httpx
 import recurring_ical_events
+from dateutil.rrule import rrulestr
 from icalendar import Calendar as ICalendar
 from icalendar import Event as IEvent
 from icalendar import Todo as ITodo
@@ -524,6 +525,7 @@ class CalDAVClient:
         reminders = await self._fetch_list_reminders(rlist)
         if not include_completed:
             reminders = [r for r in reminders if not r.completed]
+        _apply_recurring_due(reminders, _utcnow())
         reminders.sort(key=_reminder_sort_key)
         return reminders
 
@@ -572,6 +574,7 @@ class CalDAVClient:
             targets = [by_name[name.lower()] for name in lists]
         batches = await asyncio.gather(*(self._fetch_list_reminders(rl) for rl in targets))
         reminders = [r for batch in batches for r in batch]
+        _apply_recurring_due(reminders, _utcnow())
         needle = query.lower() if query else None
         after = _ensure_aware(due_after) if due_after else None
         before = _ensure_aware(due_before) if due_before else None
@@ -625,11 +628,16 @@ class CalDAVClient:
         priority: int | None = None,
         description: str | None = None,
         url: str | None = None,
+        rrule: str | None = None,
     ) -> Reminder:
         """Create a reminder (with or without a ``due`` deadline).
 
         Written at ``{list.url}{uid}.ics`` with ``If-None-Match: *`` so an
         accidental collision never overwrites an existing resource.
+
+        Args:
+            rrule: Optional recurrence rule (e.g. ``"FREQ=WEEKLY;BYDAY=MO"``)
+                to make this a recurring task. Validated before the PUT.
         """
         rlist = await self._resolve_reminder_list(list)
         uid = f"{uuid.uuid4()}"
@@ -644,6 +652,7 @@ class CalDAVClient:
             url=url,
             completed=False,
             completed_at=None,
+            rrule=rrule,
         )
         href = str(httpx.URL(rlist.url).join(f"{uid}.ics"))
         resp = await self._request(
@@ -664,6 +673,8 @@ class CalDAVClient:
             priority=priority,
             description=description,
             url=url,
+            rrule=rrule,
+            is_recurring=bool(rrule),
             href=href,
             etag=etag,
         )
@@ -679,19 +690,21 @@ class CalDAVClient:
         priority: int | None = None,
         description: str | None = None,
         url: str | None = None,
+        rrule: str | None = None,
         clear: list[str] | None = None,
     ) -> Reminder:
         """Update fields of an existing reminder; only provided fields change.
 
         The whole resource is fetched and mutated in place (rather than rebuilt
-        from a model) so any unmodeled properties — e.g. an ``RRULE`` on a
-        recurring task — survive the round-trip. Uses ``If-Match`` for safe
-        concurrency.
+        from a model) so any unmodeled properties — e.g. a ``VALARM`` on the
+        task — survive the round-trip. Uses ``If-Match`` for safe concurrency.
 
         Args:
             all_day: When provided, switches ``due``/``start`` between
                 date-valued and datetime-valued; when omitted, the existing
                 kind is preserved.
+            rrule: ``None`` keeps the current recurrence; an empty string ``""``
+                removes recurrence; any other value replaces the rule.
             clear: Field names to unset entirely (one or more of ``due``,
                 ``start``, ``description``, ``url``, ``priority``). Applied
                 before the set fields, so clearing and setting the same field
@@ -723,6 +736,12 @@ class CalDAVClient:
             _set_todo_date(todo, "due", due, effective_all_day)
         if start is not None:
             _set_todo_date(todo, "dtstart", start, effective_all_day)
+        if rrule is not None:
+            if rrule == "":
+                if "rrule" in todo:
+                    del todo["rrule"]
+            else:
+                _set_prop(todo, "rrule", _build_rrule(rrule))
         new_etag = await self._put_resource(href, cal_obj, etag)
         return _component_to_reminder(todo, rlist.name, href, new_etag)
 
@@ -735,11 +754,24 @@ class CalDAVClient:
         return await self._set_completion(list, uid, completed=False)
 
     async def _set_completion(self, list: str, uid: str, *, completed: bool) -> Reminder:
-        """Toggle the completion state of a reminder, preserving other fields."""
+        """Toggle the completion state of a reminder, preserving other fields.
+
+        Completing a **recurring** task advances it to the next occurrence
+        (``DUE``/``DTSTART`` shifted, kept ``NEEDS-ACTION``) instead of marking
+        the whole series done — matching how task apps behave. Only when the
+        series is exhausted is it marked ``COMPLETED``.
+        """
         rlist = await self._resolve_reminder_list(list)
         cal_obj, href, etag = await self._fetch_todo_resource(rlist, uid)
         todo = _require_todo(cal_obj, uid)
-        if completed:
+        rrule_prop = todo.get("rrule")
+        if (
+            completed
+            and rrule_prop is not None
+            and _advance_recurring_todo(todo, rrule_prop.to_ical().decode())
+        ):
+            pass  # advanced to the next occurrence; stays NEEDS-ACTION
+        elif completed:
             _set_prop(todo, "status", "COMPLETED")
             _set_prop(todo, "percent-complete", 100)
             _set_prop(todo, "completed", datetime.now(UTC))
@@ -1525,6 +1557,7 @@ def _build_vtodo(
     url: str | None,
     completed: bool,
     completed_at: datetime | None,
+    rrule: str | None = None,
 ) -> bytes:
     """Serialize a single-task VCALENDAR document to iCalendar bytes."""
     cal = ICalendar()
@@ -1544,6 +1577,8 @@ def _build_vtodo(
         todo.add("description", description)
     if url:
         todo.add("url", url)
+    if rrule:
+        todo.add("rrule", _build_rrule(rrule))
     if completed:
         todo.add("status", "COMPLETED")
         todo.add("percent-complete", 100)
@@ -1566,6 +1601,9 @@ def _component_to_reminder(comp: Any, list_name: str, href: str, etag: str | Non
     completed_at = _coerce_opt_dt(completed_prop)[0]
     priority_prop = comp.get("priority")
     priority = int(priority_prop) if priority_prop is not None else None
+    rrule_prop = comp.get("rrule")
+    rrule = rrule_prop.to_ical().decode() if rrule_prop is not None else None
+    is_recurring = rrule is not None or comp.get("rdate") is not None
     return Reminder(
         uid=str(comp.get("uid", "")),
         list=list_name,
@@ -1578,11 +1616,83 @@ def _component_to_reminder(comp: Any, list_name: str, href: str, etag: str | Non
         priority=priority,
         description=_opt_str(comp.get("description")),
         url=_opt_str(comp.get("url")),
+        rrule=rrule,
+        is_recurring=is_recurring,
         created=_coerce_opt_dt(comp.get("created"))[0],
         modified=_coerce_opt_dt(comp.get("last-modified"))[0],
         href=href,
         etag=etag,
     )
+
+
+def _utcnow() -> datetime:
+    """Current UTC time (indirection so tests can pin 'now')."""
+    return datetime.now(UTC)
+
+
+def _next_occurrence(
+    anchor: datetime, rrule_str: str, *, after: datetime, inclusive: bool = True
+) -> datetime | None:
+    """Next occurrence of ``rrule_str`` (anchored at ``anchor``) at/after ``after``.
+
+    Returns ``None`` when the rule is exhausted or cannot be parsed — callers
+    degrade gracefully to the stored due. ``COUNT``/``UNTIL`` rules are honored
+    relative to ``anchor`` (best-effort; see the recurrence caveat in CLAUDE.md).
+    """
+    cleaned = rrule_str.strip()
+    if cleaned.upper().startswith("RRULE:"):
+        cleaned = cleaned[len("RRULE:") :]
+    try:
+        rule = rrulestr(cleaned, dtstart=_ensure_aware(anchor))
+        nxt = rule.after(_ensure_aware(after), inc=inclusive)
+    except (ValueError, TypeError) as exc:
+        log.warning("Falha ao calcular próxima ocorrência (%s): %s", rrule_str, exc)
+        return None
+    if nxt is None:
+        return None
+    result: datetime = nxt if nxt.tzinfo is not None else nxt.replace(tzinfo=UTC)
+    return result
+
+
+def _apply_recurring_due(reminders: list[Reminder], now: datetime) -> None:
+    """Roll each recurring reminder's ``due`` forward to its next occurrence.
+
+    Mutates in place. Only dated, non-completed recurring reminders are
+    affected; if the rule is exhausted the stored due is kept.
+    """
+    for reminder in reminders:
+        if not reminder.is_recurring or reminder.rrule is None:
+            continue
+        if reminder.completed or reminder.due is None:
+            continue
+        nxt = _next_occurrence(reminder.due, reminder.rrule, after=now)
+        if nxt is not None:
+            reminder.due = nxt
+
+
+def _advance_recurring_todo(todo: Any, rrule_str: str) -> bool:
+    """Shift a recurring VTODO's ``DUE``/``DTSTART`` to the next occurrence.
+
+    Returns ``True`` if it advanced (so it stays ``NEEDS-ACTION``), ``False`` if
+    the series is exhausted (so the caller should mark the whole thing done).
+    """
+    anchor_name = "due" if todo.get("due") is not None else "dtstart"
+    anchor_prop = todo.get(anchor_name)
+    if anchor_prop is None:
+        return False
+    all_day = not isinstance(anchor_prop.dt, datetime)
+    current = _as_dt(anchor_prop.dt)
+    nxt = _next_occurrence(current, rrule_str, after=current, inclusive=False)
+    if nxt is None:
+        return False
+    delta = nxt - current
+    for name in ("due", "dtstart"):
+        prop = todo.get(name)
+        if prop is None:
+            continue
+        shifted = _as_dt(prop.dt) + delta
+        _set_prop(todo, name, shifted.date() if all_day else shifted)
+    return True
 
 
 def _parse_ics_todo(data: str, list_name: str, href: str, etag: str | None) -> Reminder | None:

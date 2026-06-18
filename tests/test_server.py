@@ -846,6 +846,7 @@ async def test_create_reminder_tool(mock_ctx: MockCtx) -> None:
         priority=1,
         description=None,
         url=None,
+        rrule=None,
     )
 
 
@@ -868,6 +869,7 @@ async def test_update_reminder_tool(mock_ctx: MockCtx) -> None:
         priority=None,
         description=None,
         url=None,
+        rrule=None,
         clear=None,
     )
 
@@ -933,6 +935,7 @@ async def test_update_reminder_tool_forwards_clear(mock_ctx: MockCtx) -> None:
         priority=None,
         description=None,
         url=None,
+        rrule=None,
         clear=["due", "priority"],
     )
 

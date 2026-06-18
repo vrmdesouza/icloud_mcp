@@ -10,13 +10,18 @@ from datetime import UTC, datetime
 import httpx
 import pytest
 
-from icloud_mcp.caldav_client import CalDAVClient
+from icloud_mcp.caldav_client import (
+    CalDAVClient,
+    _apply_recurring_due,
+    _next_occurrence,
+)
 from icloud_mcp.config import ICloudMailSettings
 from icloud_mcp.exceptions import (
     CalDAVAuthenticationError,
     CalDAVConnectionError,
     CalDAVError,
 )
+from icloud_mcp.models import Reminder
 
 # -- canned multistatus XML bodies -----------------------------------------
 
@@ -1341,3 +1346,141 @@ async def test_search_reminders_unknown_list_raises() -> None:
     with pytest.raises(CalDAVError, match="não encontrada"):
         await client.search_reminders(lists=["Nope"])
     await client.close()
+
+
+# -- reminders: Phase 3 (recurrence) ---------------------------------------
+
+
+_WEEKLY_TODO = _vtodo(
+    "todo-r", "Weekly chore", due="20260608T090000Z", extra="RRULE:FREQ=WEEKLY;BYDAY=MO"
+)
+
+
+async def test_create_recurring_reminder_puts_rrule() -> None:
+    captured: dict[str, str] = {}
+    client = _make_client(_todo_write_handler(_PENDING, captured))
+    reminder = await client.create_reminder(
+        "Tasks",
+        summary="Weekly chore",
+        due=datetime(2026, 6, 8, 9, tzinfo=UTC),
+        rrule="FREQ=WEEKLY;BYDAY=MO",
+    )
+    assert reminder.is_recurring is True
+    assert reminder.rrule == "FREQ=WEEKLY;BYDAY=MO"
+    assert "RRULE:FREQ=WEEKLY;BYDAY=MO" in captured["body"]
+    await client.close()
+
+
+async def test_create_reminder_invalid_rrule_raises_before_put() -> None:
+    put_calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "PUT":
+            put_calls["n"] += 1
+        return _default_handler(request)
+
+    client = _make_client(handler)
+    with pytest.raises(CalDAVError, match="RRULE inválida"):
+        await client.create_reminder("Tasks", summary="Bad", rrule="not a rule")
+    assert put_calls["n"] == 0
+    await client.close()
+
+
+async def test_reminder_parses_rrule() -> None:
+    captured: dict[str, str] = {}
+    client = _make_client(_todo_write_handler(_WEEKLY_TODO, captured, uid="todo-r"))
+    reminder = await client.get_reminder("Tasks", "todo-r")
+    assert reminder.is_recurring is True
+    assert reminder.rrule == "FREQ=WEEKLY;BYDAY=MO"
+    await client.close()
+
+
+async def test_update_reminder_removes_recurrence_with_empty_rrule() -> None:
+    captured: dict[str, str] = {}
+    client = _make_client(_todo_write_handler(_WEEKLY_TODO, captured, uid="todo-r"))
+    reminder = await client.update_reminder("Tasks", "todo-r", rrule="")
+    assert reminder.is_recurring is False
+    assert "RRULE" not in captured["body"]
+    await client.close()
+
+
+async def test_complete_recurring_reminder_advances_to_next_occurrence() -> None:
+    captured: dict[str, str] = {}
+    client = _make_client(_todo_write_handler(_WEEKLY_TODO, captured, uid="todo-r"))
+    reminder = await client.complete_reminder("Tasks", "todo-r")
+    body = captured["body"]
+    # Advanced from 2026-06-08 to the next Monday; stays needs-action.
+    assert "DUE:20260615T090000Z" in body
+    assert "STATUS:NEEDS-ACTION" in body
+    assert "COMPLETED:" not in body
+    assert reminder.completed is False
+    assert reminder.due == datetime(2026, 6, 15, 9, tzinfo=UTC)
+    await client.close()
+
+
+async def test_complete_exhausted_recurring_reminder_marks_done() -> None:
+    once = _vtodo(
+        "todo-once", "One shot", due="20260608T090000Z", extra="RRULE:FREQ=WEEKLY;COUNT=1"
+    )
+    captured: dict[str, str] = {}
+    client = _make_client(_todo_write_handler(once, captured, uid="todo-once"))
+    reminder = await client.complete_reminder("Tasks", "todo-once")
+    body = captured["body"]
+    # Series exhausted (COUNT=1) → the whole task is completed.
+    assert "STATUS:COMPLETED" in body
+    assert reminder.completed is True
+    await client.close()
+
+
+async def test_list_reminders_rolls_recurring_due_forward(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "icloud_mcp.caldav_client._utcnow", lambda: datetime(2026, 6, 17, tzinfo=UTC)
+    )
+    past_weekly = _vtodo(
+        "todo-r", "Weekly chore", due="20260601T090000Z", extra="RRULE:FREQ=WEEKLY;BYDAY=MO"
+    )
+    captured: dict[str, str] = {}
+    client = _make_client(_todo_write_handler(past_weekly, captured, uid="todo-r"))
+    reminders = await client.list_reminders("Tasks")
+    # Master due 2026-06-01 rolled forward to the next Monday on/after 2026-06-17.
+    assert reminders[0].due == datetime(2026, 6, 22, 9, tzinfo=UTC)
+    await client.close()
+
+
+# -- recurrence helpers (pure) ---------------------------------------------
+
+
+def test_next_occurrence_weekly() -> None:
+    nxt = _next_occurrence(
+        datetime(2026, 6, 1, 9, tzinfo=UTC),
+        "FREQ=WEEKLY;BYDAY=MO",
+        after=datetime(2026, 6, 17, tzinfo=UTC),
+    )
+    assert nxt == datetime(2026, 6, 22, 9, tzinfo=UTC)
+
+
+def test_next_occurrence_exhausted_returns_none() -> None:
+    nxt = _next_occurrence(
+        datetime(2026, 6, 1, tzinfo=UTC),
+        "FREQ=DAILY;COUNT=1",
+        after=datetime(2026, 6, 17, tzinfo=UTC),
+    )
+    assert nxt is None
+
+
+def test_apply_recurring_due_skips_completed_and_undated() -> None:
+    now = datetime(2026, 6, 17, tzinfo=UTC)
+    completed = Reminder(
+        uid="c",
+        list="Tasks",
+        completed=True,
+        is_recurring=True,
+        rrule="FREQ=WEEKLY",
+        due=datetime(2026, 6, 1, tzinfo=UTC),
+    )
+    undated = Reminder(uid="u", list="Tasks", is_recurring=True, rrule="FREQ=WEEKLY")
+    _apply_recurring_due([completed, undated], now)
+    assert completed.due == datetime(2026, 6, 1, tzinfo=UTC)  # untouched
+    assert undated.due is None

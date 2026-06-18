@@ -683,6 +683,7 @@ async def create_reminder(
     priority: int | None = None,
     description: str | None = None,
     url: str | None = None,
+    rrule: str | None = None,
 ) -> dict[str, Any]:
     """Create a reminder in a list, with or without a due date.
 
@@ -695,6 +696,8 @@ async def create_reminder(
         priority: iCalendar PRIORITY (0 none, 1-4 high, 5 medium, 6-9 low).
         description: Optional notes.
         url: Optional associated URL.
+        rrule: Optional iCalendar recurrence rule for a recurring task,
+            e.g. "FREQ=WEEKLY;BYDAY=MO" or "FREQ=DAILY;COUNT=10".
     """
     app = _get_ctx(ctx)
     reminder = await app.caldav_client.create_reminder(
@@ -706,6 +709,7 @@ async def create_reminder(
         priority=priority,
         description=description,
         url=url,
+        rrule=rrule,
     )
     return reminder.model_dump(mode="json")
 
@@ -722,6 +726,7 @@ async def update_reminder(
     priority: int | None = None,
     description: str | None = None,
     url: str | None = None,
+    rrule: str | None = None,
     clear: list[str] | None = None,
 ) -> dict[str, Any]:
     """Update fields of an existing reminder. Only provided fields change.
@@ -729,6 +734,8 @@ async def update_reminder(
     Use complete_reminder/reopen_reminder to toggle completion.
 
     Args:
+        rrule: None keeps the current recurrence; "" removes it; a non-empty
+            value replaces the recurrence rule.
         clear: Field names to unset entirely (any of "due", "start",
             "description", "url", "priority") — e.g. to remove a deadline.
     """
@@ -743,6 +750,7 @@ async def update_reminder(
         priority=priority,
         description=description,
         url=url,
+        rrule=rrule,
         clear=clear,
     )
     return reminder.model_dump(mode="json")

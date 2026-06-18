@@ -262,6 +262,7 @@ dependencies = [
     { name = "icalendar" },
     { name = "mcp" },
     { name = "pydantic-settings" },
+    { name = "python-dateutil" },
     { name = "python-dotenv" },
     { name = "recurring-ical-events" },
 ]
@@ -285,6 +286,7 @@ requires-dist = [
     { name = "pydantic-settings" },
     { name = "pytest", marker = "extra == 'dev'" },
     { name = "pytest-asyncio", marker = "extra == 'dev'" },
+    { name = "python-dateutil" },
     { name = "python-dotenv" },
     { name = "recurring-ical-events" },
     { name = "ruff", marker = "extra == 'dev'" },

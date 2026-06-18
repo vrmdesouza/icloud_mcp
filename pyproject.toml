@@ -16,6 +16,7 @@ dependencies = [
     "httpx",
     "icalendar",
     "recurring-ical-events",
+    "python-dateutil",
 ]
 
 [project.optional-dependencies]
@@ -54,6 +55,8 @@ module = [
     "recurring_ical_events",
     "recurring_ical_events.*",
     "x_wr_timezone",
+    "dateutil",
+    "dateutil.*",
 ]
 follow_imports = "skip"
 follow_untyped_imports = true

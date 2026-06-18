@@ -271,6 +271,11 @@ class Reminder(BaseModel):
         priority: iCalendar ``PRIORITY`` (0 none, 1-4 high, 5 medium, 6-9 low).
         description: Long-form notes (``DESCRIPTION``).
         url: Associated URL (``URL``).
+        rrule: Raw recurrence rule (``RRULE``), e.g. ``"FREQ=WEEKLY;BYDAY=MO"``.
+            ``None`` for a one-off task.
+        is_recurring: ``True`` when the task carries an ``RRULE`` (or ``RDATE``).
+            For recurring tasks, ``due`` reflects the **next occurrence** when
+            surfaced via ``list_reminders``/``search_reminders``.
         created: Creation timestamp (``CREATED``), if advertised by the server.
         modified: Last-modification timestamp (``LAST-MODIFIED``), if any.
         href: CalDAV resource path of the reminder (``list.url`` + ``UID.ics``).
@@ -288,6 +293,8 @@ class Reminder(BaseModel):
     priority: int | None = None
     description: str | None = None
     url: str | None = None
+    rrule: str | None = None
+    is_recurring: bool = False
     created: datetime | None = None
     modified: datetime | None = None
     href: str | None = None
