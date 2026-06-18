@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-`icloud_mail_mcp` is a Python MCP (Model Context Protocol) server that connects Claude to iCloud Mail via IMAP and SMTP. It exposes tools for reading, searching, sending emails, and managing folders using a persistent IMAP connection pool.
+`icloud_mcp` (the "iCloud MCP" server) is a Python MCP (Model Context Protocol) server that connects Claude to iCloud. It exposes tools for **Mail** (reading, searching, sending emails, managing folders) over IMAP/SMTP using a persistent IMAP connection pool, and for **Calendar** (viewing, creating, editing, deleting events) over CalDAV.
 
 ## Development Commands
 
@@ -15,7 +15,7 @@ This project uses `uv` for all package and environment management.
 uv sync
 
 # Run the MCP server (stdio transport — used by Claude Desktop)
-uv run python -m icloud_mail_mcp
+uv run python -m icloud_mcp
 
 # Linting and formatting (Ruff)
 uv run ruff check .
@@ -38,7 +38,7 @@ uv run pytest tests/test_imap_client.py::test_fetch_email -v
 uv run pytest -v --asyncio-mode=auto
 ```
 
-## iCloud Mail Configuration
+## iCloud Configuration
 
 Credentials are provided exclusively via environment variables. Create a `.env` file (never commit it):
 
@@ -47,47 +47,55 @@ ICLOUD_EMAIL=you@icloud.com
 ICLOUD_APP_PASSWORD=xxxx-xxxx-xxxx-xxxx
 ```
 
+The **same** App-Specific Password is used for Mail (IMAP/SMTP) and Calendar (CalDAV) — Apple shares the credential across both services.
+
 Optional configuration variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `IMAP_POOL_SIZE` | `3` | Number of persistent IMAP connections in the pool |
 | `IMAP_TIMEOUT` | `30` | Timeout in seconds for IMAP operations |
+| `CALDAV_TIMEOUT` | `30` | Timeout in seconds for CalDAV (Calendar) operations |
 
-> An **App-Specific Password** must be generated at appleid.apple.com — the regular Apple ID password does not work with IMAP/SMTP.
+> An **App-Specific Password** must be generated at appleid.apple.com (requires 2FA) — the regular Apple ID password does not work with IMAP/SMTP/CalDAV.
 
 A `.env.example` file should be maintained in the repo with all variables (without real values) for onboarding reference.
 
 iCloud server endpoints:
 - **IMAP**: `imap.mail.me.com:993` (SSL/TLS)
 - **SMTP**: `smtp.mail.me.com:587` (STARTTLS)
+- **CalDAV**: `caldav.icloud.com:443` (HTTPS) — the per-account calendar-home-set is discovered at runtime on a partition host (e.g. `p67-caldav.icloud.com`).
 
 ## Code Conventions
 
 - **Language**: Code, variable names, docstrings, and comments in English. Log messages and user-facing error messages in Portuguese (PT-BR).
 - **Docstrings**: Google-style for all public functions and classes.
 - **Type hints**: Required on all functions (mypy strict is enforced).
-- **Custom exceptions**: Use a hierarchy of custom exceptions for IMAP/SMTP errors:
+- **Custom exceptions**: Use a hierarchy of custom exceptions:
   - `IMAPConnectionError` — connection or pool failures
   - `IMAPAuthenticationError` — login/credential failures
   - `SMTPSendError` — send failures
-  - All inherit from a base `ICloudMailError`
+  - `CalDAVError` / `CalDAVConnectionError` / `CalDAVAuthenticationError` — Calendar errors
+  - All inherit from a base `ICloudError` (`ICloudMailError` remains as a backward-compatible alias)
 
 ## Architecture
 
 ```
-src/icloud_mail_mcp/
+src/icloud_mcp/
 ├── __main__.py       # Entry point: runs the MCP server via stdio
 ├── server.py         # Tool/resource registration with @mcp.tool() decorators
 ├── config.py         # Loads and validates env vars (ICLOUD_EMAIL, ICLOUD_APP_PASSWORD)
 ├── imap_client.py    # Persistent IMAP connection pool — all read/search/folder ops
 ├── smtp_client.py    # SMTP client — creates connection per send operation
-└── models.py         # Pydantic models: Email, Folder, SearchQuery, etc.
+├── caldav_client.py  # Async CalDAV client (httpx) — Calendar discovery + event CRUD
+├── rules.py          # Local JSON-backed mail filtering rules engine
+└── models.py         # Pydantic models: Email, Folder, Calendar, CalendarEvent, etc.
 
 tests/
 ├── conftest.py       # Shared fixtures (mock IMAP/SMTP connections)
 ├── test_imap_client.py
 ├── test_smtp_client.py
+├── test_caldav_client.py  # CalDAV client tests (httpx.MockTransport, no network)
 └── test_server.py    # Tests for MCP tool handlers
 ```
 
@@ -102,6 +110,8 @@ tests/
 **SMTP is stateless**: `smtp_client.py` opens a fresh `aiosmtplib` connection per send operation. No pooling needed.
 
 **Server entry point** (`server.py`): All MCP tools are registered here using the `@mcp.tool()` decorator from the official `mcp` SDK. Tools call into `imap_client` or `smtp_client` — no IMAP/SMTP logic belongs in `server.py`.
+
+**CalDAV is stateless** (`caldav_client.py`): No connection pool. A single `httpx.AsyncClient` carries Basic Auth across requests. At startup, `connect()` runs the two-step iCloud discovery (`current-user-principal` → `calendar-home-set`) and caches the resulting partition-host URL. Events are addressed by `href`/`ETag` we track ourselves, sidestepping iCloud's broken `get_object_by_uid`. Recurring events, attendees and alarms are intentionally out of scope for v1.
 
 **Config validation** (`config.py`): Reads env vars at startup and fails fast with a clear error if required vars are missing. Use `pydantic-settings` for this.
 
@@ -118,13 +128,23 @@ tests/
 - **Retry**: Simple retry — 2 attempts (connection is ephemeral, failures are usually transient).
 - **Exceptions**: Raise `SMTPSendError` with the original error context.
 
+### CalDAV
+
+- **Retry**: Simple retry — 3 attempts with delays of 1s, 2s on transport errors and HTTP 5xx.
+- **Auth**: HTTP 401 raises `CalDAVAuthenticationError` immediately (no retry) — usually a regular password used where an App-Specific Password belongs.
+- **Exceptions**: Other 4xx raise `CalDAVError`; exhausted retries raise `CalDAVConnectionError`.
+
 ### Exception Hierarchy
 
 ```python
-class ICloudMailError(Exception): ...
-class IMAPConnectionError(ICloudMailError): ...
-class IMAPAuthenticationError(ICloudMailError): ...
-class SMTPSendError(ICloudMailError): ...
+class ICloudError(Exception): ...
+ICloudMailError = ICloudError  # backward-compatible alias
+class IMAPConnectionError(ICloudError): ...
+class IMAPAuthenticationError(ICloudError): ...
+class SMTPSendError(ICloudError): ...
+class CalDAVError(ICloudError): ...
+class CalDAVConnectionError(CalDAVError): ...
+class CalDAVAuthenticationError(CalDAVError): ...
 ```
 
 ## MCP Tools
@@ -139,6 +159,19 @@ class SMTPSendError(ICloudMailError): ...
 | `move_email` | IMAP | `folder: str`, `uid: str`, `destination: str` | `dict` | Move email between folders (COPY + delete original) |
 | `delete_email` | IMAP | `folder: str`, `uid: str` | `dict` | Move email to Trash |
 | `create_folder` | IMAP | `name: str` | `Folder` | Create a new mailbox folder |
+
+> Mail also exposes additional tools (`mark_as_read`/`mark_as_unread`, `flag_email`/`unflag_email`, `bulk_action`, `rename_folder`, `delete_folder`, `get_folder_stats`, `list_attachments`, `download_attachment`, `save_draft`, `reply_email`, `forward_email`, and the rules tools). See `server.py`.
+
+### Calendar Tools (CalDAV)
+
+| Tool | Parameters | Return | Description |
+|------|------------|--------|-------------|
+| `list_calendars` | — | `list[Calendar]` | List calendars that support events |
+| `list_events` | `calendar: str`, `start: str`, `end: str` | `list[CalendarEvent]` | Events overlapping the `[start, end)` time range (ISO 8601) |
+| `get_event` | `calendar: str`, `uid: str` | `CalendarEvent` | Fetch a single event by iCalendar UID |
+| `create_event` | `calendar: str`, `summary: str`, `start: str`, `end: str`, `all_day: bool = False`, `location: str?`, `description: str?` | `CalendarEvent` | Create a new event |
+| `update_event` | `calendar: str`, `uid: str`, + optional `summary`/`start`/`end`/`all_day`/`location`/`description` | `CalendarEvent` | Update only the provided fields |
+| `delete_event` | `calendar: str`, `uid: str` | `dict` | Delete an event by UID |
 
 ### Pagination (`list_emails`)
 
@@ -192,6 +225,8 @@ testpaths = ["tests"]
 - `mcp` — Anthropic official MCP Python SDK
 - `aioimaplib` — async IMAP4 client
 - `aiosmtplib` — async SMTP client
+- `httpx` — async HTTP client (CalDAV transport)
+- `icalendar` — build/parse iCalendar (`VEVENT`) documents
 - `pydantic-settings` — env var loading with validation
 - `python-dotenv` — `.env` file support in development
 - `ruff`, `mypy`, `pytest`, `pytest-asyncio` — dev dependencies

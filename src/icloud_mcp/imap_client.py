@@ -16,9 +16,9 @@ from typing import Any, TypeVar, cast
 import aioimaplib
 from aioimaplib import IMAP4_SSL
 
-from icloud_mail_mcp.config import ICloudMailSettings
-from icloud_mail_mcp.exceptions import IMAPAuthenticationError, IMAPConnectionError
-from icloud_mail_mcp.models import (
+from icloud_mcp.config import ICloudMailSettings
+from icloud_mcp.exceptions import IMAPAuthenticationError, IMAPConnectionError
+from icloud_mcp.models import (
     Attachment,
     Email,
     EmailListResult,

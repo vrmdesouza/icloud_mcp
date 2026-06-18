@@ -4,16 +4,17 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from typing import Any
 
 from mcp.server.fastmcp import Context, FastMCP
 
-from icloud_mail_mcp.config import get_settings
-from icloud_mail_mcp.imap_client import IMAPClient, IMAPConnectionPool
-from icloud_mail_mcp.models import SearchQuery
-from icloud_mail_mcp.rules import RulesEngine
-from icloud_mail_mcp.smtp_client import SMTPClient
+from icloud_mcp.caldav_client import CalDAVClient
+from icloud_mcp.config import get_settings
+from icloud_mcp.imap_client import IMAPClient, IMAPConnectionPool
+from icloud_mcp.models import SearchQuery
+from icloud_mcp.rules import RulesEngine
+from icloud_mcp.smtp_client import SMTPClient
 
 log = logging.getLogger(__name__)
 
@@ -25,28 +26,34 @@ class AppContext:
     imap_client: IMAPClient
     smtp_client: SMTPClient
     rules_engine: RulesEngine
+    caldav_client: CalDAVClient
 
 
 @asynccontextmanager
 async def app_lifespan(app: FastMCP[AppContext]) -> AsyncIterator[AppContext]:
-    """Initialize the IMAP pool and wire up clients on server start."""
+    """Initialize the IMAP pool and CalDAV client, wiring up clients on start."""
     settings = get_settings()
     pool = IMAPConnectionPool(settings)
     log.info("Inicializando pool de conexões IMAP...")
     await pool.initialize()
     log.info("Pool IMAP inicializado com %d conexões.", settings.imap_pool_size)
+    caldav_client = CalDAVClient(settings)
     try:
+        log.info("Descobrindo serviço CalDAV do iCloud...")
+        await caldav_client.connect()
         yield AppContext(
             imap_client=IMAPClient(pool),
             smtp_client=SMTPClient(settings),
             rules_engine=RulesEngine(),
+            caldav_client=caldav_client,
         )
     finally:
-        log.info("Encerrando pool de conexões IMAP...")
+        log.info("Encerrando pool de conexões IMAP e cliente CalDAV...")
         await pool.close()
+        await caldav_client.close()
 
 
-mcp: FastMCP[AppContext] = FastMCP("icloud-mail-mcp", lifespan=app_lifespan)
+mcp: FastMCP[AppContext] = FastMCP("icloud-mcp", lifespan=app_lifespan)
 
 
 def _get_ctx(ctx: Context) -> AppContext:  # type: ignore[type-arg]
@@ -397,3 +404,120 @@ async def apply_rules(ctx: Context, folder: str = "INBOX") -> dict[str, Any]:  #
     """Apply all enabled rules to emails in a folder. Returns processing stats."""
     app = _get_ctx(ctx)
     return await app.rules_engine.apply_rules(folder=folder, imap_client=app.imap_client)
+
+
+def _parse_datetime(value: str, field: str) -> datetime:
+    """Parse an ISO 8601 datetime (or date) string into a datetime."""
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(
+            f"Formato de data/hora inválido para '{field}': '{value}'. "
+            "Use ISO 8601 (YYYY-MM-DD ou YYYY-MM-DDTHH:MM:SS)."
+        ) from exc
+
+
+@mcp.tool()
+async def list_calendars(ctx: Context) -> list[dict[str, Any]]:  # type: ignore[type-arg]
+    """List all iCloud calendars that support events."""
+    app = _get_ctx(ctx)
+    calendars = await app.caldav_client.list_calendars()
+    return [c.model_dump() for c in calendars]
+
+
+@mcp.tool()
+async def list_events(
+    ctx: Context,  # type: ignore[type-arg]
+    calendar: str,
+    start: str,
+    end: str,
+) -> list[dict[str, Any]]:
+    """List events in a calendar within a time range.
+
+    Args:
+        calendar: Calendar display name (see list_calendars).
+        start: Range start, inclusive (ISO 8601, e.g. 2026-06-01 or 2026-06-01T09:00:00).
+        end: Range end, exclusive (ISO 8601).
+    """
+    app = _get_ctx(ctx)
+    start_dt = _parse_datetime(start, "start")
+    end_dt = _parse_datetime(end, "end")
+    events = await app.caldav_client.list_events(calendar=calendar, start=start_dt, end=end_dt)
+    return [e.model_dump(mode="json") for e in events]
+
+
+@mcp.tool()
+async def get_event(ctx: Context, calendar: str, uid: str) -> dict[str, Any]:  # type: ignore[type-arg]
+    """Fetch a single calendar event by its iCalendar UID."""
+    app = _get_ctx(ctx)
+    event = await app.caldav_client.get_event(calendar=calendar, uid=uid)
+    return event.model_dump(mode="json")
+
+
+@mcp.tool()
+async def create_event(
+    ctx: Context,  # type: ignore[type-arg]
+    calendar: str,
+    summary: str,
+    start: str,
+    end: str,
+    all_day: bool = False,
+    location: str | None = None,
+    description: str | None = None,
+) -> dict[str, Any]:
+    """Create a new event in a calendar.
+
+    Args:
+        calendar: Target calendar display name.
+        summary: Event title.
+        start: Start datetime (ISO 8601). For all_day events a date is enough.
+        end: End datetime (ISO 8601, exclusive).
+        all_day: True for an all-day event (time component ignored).
+        location: Optional location text.
+        description: Optional notes.
+    """
+    app = _get_ctx(ctx)
+    event = await app.caldav_client.create_event(
+        calendar=calendar,
+        summary=summary,
+        start=_parse_datetime(start, "start"),
+        end=_parse_datetime(end, "end"),
+        all_day=all_day,
+        location=location,
+        description=description,
+    )
+    return event.model_dump(mode="json")
+
+
+@mcp.tool()
+async def update_event(
+    ctx: Context,  # type: ignore[type-arg]
+    calendar: str,
+    uid: str,
+    summary: str | None = None,
+    start: str | None = None,
+    end: str | None = None,
+    all_day: bool | None = None,
+    location: str | None = None,
+    description: str | None = None,
+) -> dict[str, Any]:
+    """Update fields of an existing event. Only provided fields change."""
+    app = _get_ctx(ctx)
+    event = await app.caldav_client.update_event(
+        calendar=calendar,
+        uid=uid,
+        summary=summary,
+        start=_parse_datetime(start, "start") if start is not None else None,
+        end=_parse_datetime(end, "end") if end is not None else None,
+        all_day=all_day,
+        location=location,
+        description=description,
+    )
+    return event.model_dump(mode="json")
+
+
+@mcp.tool()
+async def delete_event(ctx: Context, calendar: str, uid: str) -> dict[str, str]:  # type: ignore[type-arg]
+    """Delete a calendar event by its iCalendar UID."""
+    app = _get_ctx(ctx)
+    return await app.caldav_client.delete_event(calendar=calendar, uid=uid)

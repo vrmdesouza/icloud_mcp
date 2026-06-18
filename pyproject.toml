@@ -3,9 +3,9 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "icloud-mail-mcp"
+name = "icloud-mcp"
 version = "0.1.0"
-description = "MCP server connecting Claude to iCloud Mail via IMAP and SMTP"
+description = "MCP server connecting Claude to iCloud (Mail via IMAP/SMTP, Calendar via CalDAV)"
 requires-python = ">=3.12"
 dependencies = [
     "mcp",
@@ -13,6 +13,8 @@ dependencies = [
     "aiosmtplib",
     "pydantic-settings",
     "python-dotenv",
+    "httpx",
+    "icalendar",
 ]
 
 [project.optional-dependencies]
@@ -24,7 +26,7 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/icloud_mail_mcp"]
+packages = ["src/icloud_mcp"]
 
 [tool.ruff]
 target-version = "py312"
@@ -40,6 +42,13 @@ python_version = "3.12"
 [[tool.mypy.overrides]]
 module = ["aioimaplib", "aioimaplib.*"]
 ignore_missing_imports = true
+
+# icalendar ships py.typed but its component constructors/.get are untyped,
+# which trips strict's no-untyped-call. Treat it as an opaque (Any) module.
+[[tool.mypy.overrides]]
+module = ["icalendar", "icalendar.*"]
+follow_imports = "skip"
+follow_untyped_imports = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

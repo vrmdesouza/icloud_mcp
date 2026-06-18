@@ -1,4 +1,4 @@
-"""Pydantic data models shared across icloud_mail_mcp modules."""
+"""Pydantic data models shared across icloud_mcp modules."""
 
 from datetime import date, datetime
 from typing import Literal
@@ -170,3 +170,50 @@ class Rule(BaseModel):
     conditions: list[RuleCondition] = Field(default_factory=list)
     actions: list[RuleAction] = Field(default_factory=list)
     created_at: str | None = None
+
+
+class Calendar(BaseModel):
+    """Represents an iCloud CalDAV calendar collection.
+
+    Attributes:
+        name: Human-readable display name (``displayname`` property).
+        url: Absolute URL of the calendar collection on the partition host.
+        color: Calendar color as a hex string (``#RRGGBB``), if advertised.
+        read_only: ``True`` when the current user cannot write to the calendar.
+    """
+
+    name: str
+    url: str
+    color: str | None = None
+    read_only: bool = False
+
+
+class CalendarEvent(BaseModel):
+    """Represents a single calendar event (a ``VEVENT`` component).
+
+    Datetimes are timezone-aware. For all-day events ``all_day`` is ``True``
+    and the time component of ``start``/``end`` is not significant.
+
+    Attributes:
+        uid: iCalendar ``UID`` — stable identifier of the event.
+        calendar: Name of the calendar the event belongs to.
+        summary: Event title (``SUMMARY``).
+        start: Event start (``DTSTART``).
+        end: Event end (``DTEND``).
+        all_day: Whether this is an all-day event (date-valued DTSTART/DTEND).
+        location: Free-form location (``LOCATION``).
+        description: Long-form notes (``DESCRIPTION``).
+        href: CalDAV resource path of the event (``calendar.url`` + ``UID.ics``).
+        etag: Server ETag, used for optimistic concurrency on update/delete.
+    """
+
+    uid: str
+    calendar: str
+    summary: str = ""
+    start: datetime
+    end: datetime
+    all_day: bool = False
+    location: str | None = None
+    description: str | None = None
+    href: str | None = None
+    etag: str | None = None

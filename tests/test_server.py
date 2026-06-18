@@ -1,32 +1,45 @@
 """Tests for server.py — MCP tool handlers and lifespan."""
 
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from icloud_mail_mcp.imap_client import IMAPClient
-from icloud_mail_mcp.models import Attachment, Email, EmailListResult, Folder, FolderStats
-from icloud_mail_mcp.rules import RulesEngine
-from icloud_mail_mcp.server import (
+from icloud_mcp.imap_client import IMAPClient
+from icloud_mcp.models import (
+    Attachment,
+    Calendar,
+    CalendarEvent,
+    Email,
+    EmailListResult,
+    Folder,
+    FolderStats,
+)
+from icloud_mcp.rules import RulesEngine
+from icloud_mcp.server import (
     AppContext,
     app_lifespan,
     apply_rules,
     bulk_action,
+    create_event,
     create_folder,
     create_rule,
     delete_email,
+    delete_event,
     delete_folder,
     delete_rule,
     download_attachment,
     flag_email,
     forward_email,
     get_email,
+    get_event,
     get_folder_stats,
     list_attachments,
+    list_calendars,
     list_emails,
+    list_events,
     list_folders,
     list_rules,
     mark_as_read,
@@ -39,6 +52,7 @@ from icloud_mail_mcp.server import (
     search_emails,
     send_email,
     unflag_email,
+    update_event,
 )
 
 MockCtx = tuple[MagicMock, AsyncMock, AsyncMock, RulesEngine]
@@ -50,11 +64,13 @@ def mock_ctx(tmp_path: Path) -> MockCtx:
     imap_client = AsyncMock()
     smtp_client = AsyncMock()
     rules_engine = RulesEngine(rules_dir=tmp_path)
+    caldav_client = AsyncMock()
     ctx = MagicMock()
     ctx.request_context.lifespan_context = AppContext(
         imap_client=imap_client,
         smtp_client=smtp_client,
         rules_engine=rules_engine,
+        caldav_client=caldav_client,
     )
     return ctx, imap_client, smtp_client, rules_engine
 
@@ -357,18 +373,23 @@ async def test_lifespan_init_and_close() -> None:
     mock_smtp_client: Any = MagicMock()
 
     mock_rules: Any = MagicMock()
+    mock_caldav = AsyncMock()
 
-    with patch("icloud_mail_mcp.server.get_settings", return_value=mock_settings):
-        with patch("icloud_mail_mcp.server.IMAPConnectionPool", return_value=mock_pool):
-            with patch("icloud_mail_mcp.server.SMTPClient", return_value=mock_smtp_client):
-                with patch("icloud_mail_mcp.server.RulesEngine", return_value=mock_rules):
-                    async with app_lifespan(mcp) as ctx:
-                        mock_pool.initialize.assert_called_once()
-                        assert isinstance(ctx.imap_client, IMAPClient)
-                        assert ctx.smtp_client is mock_smtp_client
-                        assert ctx.rules_engine is mock_rules
+    with patch("icloud_mcp.server.get_settings", return_value=mock_settings):
+        with patch("icloud_mcp.server.IMAPConnectionPool", return_value=mock_pool):
+            with patch("icloud_mcp.server.SMTPClient", return_value=mock_smtp_client):
+                with patch("icloud_mcp.server.RulesEngine", return_value=mock_rules):
+                    with patch("icloud_mcp.server.CalDAVClient", return_value=mock_caldav):
+                        async with app_lifespan(mcp) as ctx:
+                            mock_pool.initialize.assert_called_once()
+                            mock_caldav.connect.assert_called_once()
+                            assert isinstance(ctx.imap_client, IMAPClient)
+                            assert ctx.smtp_client is mock_smtp_client
+                            assert ctx.rules_engine is mock_rules
+                            assert ctx.caldav_client is mock_caldav
 
                     mock_pool.close.assert_called_once()
+                    mock_caldav.close.assert_called_once()
 
 
 async def test_save_draft_tool(
@@ -497,3 +518,154 @@ async def test_search_emails_invalid_before_date(
     ctx, _, _, _ = mock_ctx
     with pytest.raises(ValueError, match="Formato de data inválido para 'before'"):
         await search_emails(ctx, before="31/12/2024")
+
+
+# -- Calendar (CalDAV) tool handlers ---------------------------------------
+
+
+def _caldav(ctx: MagicMock) -> AsyncMock:
+    """Extract the AsyncMock CalDAVClient from a mock context."""
+    client: AsyncMock = ctx.request_context.lifespan_context.caldav_client
+    return client
+
+
+async def test_list_calendars_tool(mock_ctx: MockCtx) -> None:
+    """list_calendars delegates to caldav_client and serializes Calendar models."""
+    ctx, *_ = mock_ctx
+    caldav = _caldav(ctx)
+    caldav.list_calendars.return_value = [
+        Calendar(name="Work", url="https://p1/cal/work/", color="#FF0000"),
+    ]
+
+    result = await list_calendars(ctx)
+
+    assert result == [
+        {
+            "name": "Work",
+            "url": "https://p1/cal/work/",
+            "color": "#FF0000",
+            "read_only": False,
+        }
+    ]
+    caldav.list_calendars.assert_called_once()
+
+
+async def test_list_events_tool_parses_dates(mock_ctx: MockCtx) -> None:
+    """list_events parses ISO date strings and forwards datetimes to the client."""
+    ctx, *_ = mock_ctx
+    caldav = _caldav(ctx)
+    caldav.list_events.return_value = [
+        CalendarEvent(
+            uid="e1",
+            calendar="Work",
+            summary="Standup",
+            start=datetime(2026, 6, 1, 9, tzinfo=UTC),
+            end=datetime(2026, 6, 1, 9, 30, tzinfo=UTC),
+        )
+    ]
+
+    result = await list_events(ctx, calendar="Work", start="2026-06-01", end="2026-06-02")
+
+    assert result[0]["uid"] == "e1"
+    caldav.list_events.assert_called_once_with(
+        calendar="Work",
+        start=datetime(2026, 6, 1),
+        end=datetime(2026, 6, 2),
+    )
+
+
+async def test_list_events_tool_invalid_date(mock_ctx: MockCtx) -> None:
+    """list_events raises ValueError on a malformed date string."""
+    ctx, *_ = mock_ctx
+    with pytest.raises(ValueError, match="Formato de data/hora inválido para 'start'"):
+        await list_events(ctx, calendar="Work", start="nope", end="2026-06-02")
+
+
+async def test_get_event_tool(mock_ctx: MockCtx) -> None:
+    """get_event delegates to caldav_client and serializes the event."""
+    ctx, *_ = mock_ctx
+    caldav = _caldav(ctx)
+    caldav.get_event.return_value = CalendarEvent(
+        uid="e1",
+        calendar="Work",
+        summary="Standup",
+        start=datetime(2026, 6, 1, 9, tzinfo=UTC),
+        end=datetime(2026, 6, 1, 9, 30, tzinfo=UTC),
+    )
+
+    result = await get_event(ctx, calendar="Work", uid="e1")
+
+    assert result["uid"] == "e1"
+    caldav.get_event.assert_called_once_with(calendar="Work", uid="e1")
+
+
+async def test_create_event_tool(mock_ctx: MockCtx) -> None:
+    """create_event parses dates and forwards all fields to the client."""
+    ctx, *_ = mock_ctx
+    caldav = _caldav(ctx)
+    caldav.create_event.return_value = CalendarEvent(
+        uid="new",
+        calendar="Work",
+        summary="Lunch",
+        start=datetime(2026, 6, 1, 12, tzinfo=UTC),
+        end=datetime(2026, 6, 1, 13, tzinfo=UTC),
+    )
+
+    result = await create_event(
+        ctx,
+        calendar="Work",
+        summary="Lunch",
+        start="2026-06-01T12:00:00",
+        end="2026-06-01T13:00:00",
+        location="Cafe",
+    )
+
+    assert result["uid"] == "new"
+    caldav.create_event.assert_called_once_with(
+        calendar="Work",
+        summary="Lunch",
+        start=datetime(2026, 6, 1, 12),
+        end=datetime(2026, 6, 1, 13),
+        all_day=False,
+        location="Cafe",
+        description=None,
+    )
+
+
+async def test_update_event_tool_partial(mock_ctx: MockCtx) -> None:
+    """update_event passes only the provided fields, leaving dates as None."""
+    ctx, *_ = mock_ctx
+    caldav = _caldav(ctx)
+    caldav.update_event.return_value = CalendarEvent(
+        uid="e1",
+        calendar="Work",
+        summary="Renamed",
+        start=datetime(2026, 6, 1, 9, tzinfo=UTC),
+        end=datetime(2026, 6, 1, 10, tzinfo=UTC),
+    )
+
+    result = await update_event(ctx, calendar="Work", uid="e1", summary="Renamed")
+
+    assert result["summary"] == "Renamed"
+    caldav.update_event.assert_called_once_with(
+        calendar="Work",
+        uid="e1",
+        summary="Renamed",
+        start=None,
+        end=None,
+        all_day=None,
+        location=None,
+        description=None,
+    )
+
+
+async def test_delete_event_tool(mock_ctx: MockCtx) -> None:
+    """delete_event delegates to the client and returns its status dict."""
+    ctx, *_ = mock_ctx
+    caldav = _caldav(ctx)
+    caldav.delete_event.return_value = {"status": "deleted", "uid": "e1"}
+
+    result = await delete_event(ctx, calendar="Work", uid="e1")
+
+    assert result == {"status": "deleted", "uid": "e1"}
+    caldav.delete_event.assert_called_once_with(calendar="Work", uid="e1")

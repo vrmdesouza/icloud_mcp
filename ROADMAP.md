@@ -508,3 +508,27 @@ Phase 20 (reply/forward)           ← depende de SMTP + IMAP existentes
   │
 Phase 21 (rules/filters)           ← depende de todas as acoes anteriores (aplica move, flag, etc.)
 ```
+
+---
+
+## Phase 22: iCloud Calendar (CalDAV)
+
+**Objetivo**: Expandir o servidor de "iCloud Mail MCP" para "iCloud MCP", adicionando suporte a Calendar via CalDAV. Visualizar, criar, editar e deletar eventos. Mesma credencial (App-Specific Password) ja usada pelo Mail.
+
+**Decisoes-chave**:
+- **Rename completo**: pacote `icloud_mail_mcp` → `icloud_mcp`; servidor FastMCP `"icloud-mcp"`; base de excecoes `ICloudMailError` → `ICloudError` (alias mantido).
+- **Cliente async hand-rolled** sobre `httpx.AsyncClient` (sem pool — CalDAV e stateless), no estilo do `imap_client`. `icalendar` para build/parse de `VEVENT`.
+- **Discovery em 2 passos** no startup: `current-user-principal` → `calendar-home-set` (resolve o partition host `pXX-caldav.icloud.com`), cacheado.
+- **Escopo v1**: campos essenciais (summary, start/end, all_day, location, description). Recorrencia, convidados e alarmes ficam fora de escopo.
+
+**Arquivos criados/modificados**:
+- `src/icloud_mcp/exceptions.py` — base `ICloudError` + `CalDAVError`/`CalDAVConnectionError`/`CalDAVAuthenticationError`.
+- `src/icloud_mcp/config.py` — `caldav_url`, `caldav_timeout`.
+- `src/icloud_mcp/models.py` — novos modelos `Calendar` e `CalendarEvent`.
+- `src/icloud_mcp/caldav_client.py` — NOVO. `CalDAVClient` async: `connect()` (discovery), `list_calendars`, `list_events` (REPORT `calendar-query` + `time-range`), `get_event` (REPORT por UID, contornando o `get_object_by_uid` quebrado do iCloud), `create_event`/`update_event` (PUT iCalendar, `If-None-Match`/`If-Match`), `delete_event`. Retry simples + mapeamento de excecoes.
+- `src/icloud_mcp/server.py` — `caldav_client` no `AppContext`/lifespan + 6 tools: `list_calendars`, `list_events`, `get_event`, `create_event`, `update_event`, `delete_event`.
+- `tests/test_caldav_client.py` — NOVO. Mocks via `httpx.MockTransport` (PROPFIND/REPORT/PUT/DELETE): discovery, partition host, list/get/create/update/delete, 401→auth error, retry. Sem rede real.
+- `tests/test_server.py` — fixture com `caldav_client` mockado + testes dos 6 tool handlers; lifespan cobrindo `connect`/`close`.
+- `pyproject.toml` — deps `httpx` + `icalendar`; override mypy tratando `icalendar` como modulo opaco.
+
+**Verificacao**: `uv run ruff check . && uv run ruff format --check . && uv run mypy src/ && uv run pytest -v`
