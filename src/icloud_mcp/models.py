@@ -234,33 +234,33 @@ class CalendarEvent(BaseModel):
 
 
 class ReminderList(BaseModel):
-    """Represents an iCloud Reminders list (a CalDAV ``VTODO`` collection).
+    """Represents an iCloud Reminders list (a native EventKit ``EKCalendar``).
 
-    Structurally identical to :class:`Calendar`, but kept separate because the
-    underlying collection stores tasks (``VTODO``) rather than events.
+    Reminders are served by the local macOS Reminders app via EventKit, so a
+    list maps to an ``EKCalendar`` of the reminders entity type.
 
     Attributes:
-        name: Human-readable display name (``displayname`` property).
-        url: Absolute URL of the collection on the partition host.
-        color: List color as a hex string (``#RRGGBB``), if advertised.
-        read_only: ``True`` when the current user cannot write to the list.
+        name: Human-readable display name (``EKCalendar.title``).
+        identifier: Stable EventKit identifier (``EKCalendar.calendarIdentifier``).
+        color: List color as a hex string (``#RRGGBB``), if available.
+        read_only: ``True`` when the list does not allow content modifications.
     """
 
     name: str
-    url: str
+    identifier: str
     color: str | None = None
     read_only: bool = False
 
 
 class ReminderAlarm(BaseModel):
-    """A display alarm on a reminder (a ``VALARM`` component).
+    """A display alarm on a reminder (a native EventKit ``EKAlarm``).
 
     Exactly one of the two fields is set:
 
     Attributes:
         minutes_before: Minutes before the reminder's ``due`` (or ``start`` if
-            there is no due) to fire — a relative ``TRIGGER``.
-        trigger: Absolute date/time to fire — an absolute ``TRIGGER``.
+            there is no due) to fire — a relative alarm (``relativeOffset``).
+        trigger: Absolute date/time to fire — an absolute alarm (``absoluteDate``).
     """
 
     minutes_before: int | None = None
@@ -268,38 +268,32 @@ class ReminderAlarm(BaseModel):
 
 
 class Reminder(BaseModel):
-    """Represents a single reminder/task (a ``VTODO`` component).
+    """Represents a single reminder/task (a native EventKit ``EKReminder``).
 
     Datetimes are timezone-aware. ``due`` is the deadline that makes a reminder
     show up in the calendar timeline; a reminder without ``due`` is a plain
     task. For all-day reminders ``all_day`` is ``True`` and the time component
     of ``due``/``start`` is not significant.
 
-    Recurring reminders (``RRULE``) are out of scope for v1: an existing rule is
-    preserved on update but neither expanded nor created.
-
     Attributes:
-        uid: iCalendar ``UID`` — stable identifier of the reminder.
+        uid: Stable identifier of the reminder (``calendarItemExternalIdentifier``).
         list: Name of the reminders list the task belongs to.
-        summary: Task title (``SUMMARY``).
-        completed: Whether the task is done (``STATUS:COMPLETED``).
-        completed_at: Completion timestamp (``COMPLETED``), if any.
-        due: Deadline (``DUE``). ``None`` for a task without a deadline.
-        start: Start date/time (``DTSTART``), if any.
+        summary: Task title (``EKReminder.title``).
+        completed: Whether the task is done (``EKReminder.isCompleted``).
+        completed_at: Completion timestamp (``completionDate``), if any.
+        due: Deadline (``dueDateComponents``). ``None`` for a task without one.
+        start: Start date/time (``startDateComponents``), if any.
         all_day: Whether ``due``/``start`` are date-valued (no time component).
-        priority: iCalendar ``PRIORITY`` (0 none, 1-4 high, 5 medium, 6-9 low).
-        description: Long-form notes (``DESCRIPTION``).
-        url: Associated URL (``URL``).
+        priority: iCalendar ``PRIORITY`` (0 none, 1-4 high, 5 medium, 6-9 low) —
+            EventKit uses the same scale.
+        description: Long-form notes (``EKReminder.notes``).
+        url: Associated URL (``EKReminder.URL``).
         rrule: Raw recurrence rule (``RRULE``), e.g. ``"FREQ=WEEKLY;BYDAY=MO"``.
-            ``None`` for a one-off task.
-        is_recurring: ``True`` when the task carries an ``RRULE`` (or ``RDATE``).
-            For recurring tasks, ``due`` reflects the **next occurrence** when
-            surfaced via ``list_reminders``/``search_reminders``.
-        alarms: Display alarms on the task (``VALARM`` components).
-        created: Creation timestamp (``CREATED``), if advertised by the server.
-        modified: Last-modification timestamp (``LAST-MODIFIED``), if any.
-        href: CalDAV resource path of the reminder (``list.url`` + ``UID.ics``).
-        etag: Server ETag, used for optimistic concurrency on update/delete.
+            ``None`` for a one-off task. Derived from ``EKReminder.recurrenceRules``.
+        is_recurring: ``True`` when the task carries a recurrence rule.
+        alarms: Display alarms on the task (``EKReminder.alarms``).
+        created: Creation timestamp (``EKReminder.creationDate``), if any.
+        modified: Last-modification timestamp (``lastModifiedDate``), if any.
     """
 
     uid: str
@@ -318,5 +312,3 @@ class Reminder(BaseModel):
     alarms: _list[ReminderAlarm] = Field(default_factory=_list)
     created: datetime | None = None
     modified: datetime | None = None
-    href: str | None = None
-    etag: str | None = None

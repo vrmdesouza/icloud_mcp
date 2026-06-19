@@ -16,7 +16,7 @@ dependencies = [
     "httpx",
     "icalendar",
     "recurring-ical-events",
-    "python-dateutil",
+    "pyobjc-framework-EventKit; sys_platform == 'darwin'",
 ]
 
 [project.optional-dependencies]
@@ -45,6 +45,21 @@ python_version = "3.12"
 module = ["aioimaplib", "aioimaplib.*"]
 ignore_missing_imports = true
 
+# PyObjC frameworks (EventKit/Foundation) and the objc bridge ship no usable
+# type information — treat them as opaque on the macOS-only Reminders path.
+[[tool.mypy.overrides]]
+module = [
+    "EventKit",
+    "EventKit.*",
+    "Foundation",
+    "Foundation.*",
+    "AppKit",
+    "AppKit.*",
+    "objc",
+    "objc.*",
+]
+ignore_missing_imports = true
+
 # icalendar ships py.typed but its component constructors/.get are untyped,
 # which trips strict's no-untyped-call. Treat it as an opaque (Any) module.
 # recurring_ical_events / x_wr_timezone ship no py.typed at all.
@@ -55,8 +70,6 @@ module = [
     "recurring_ical_events",
     "recurring_ical_events.*",
     "x_wr_timezone",
-    "dateutil",
-    "dateutil.*",
 ]
 follow_imports = "skip"
 follow_untyped_imports = true

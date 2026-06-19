@@ -76,3 +76,37 @@ class CalDAVAuthenticationError(CalDAVError):
     Example:
         raise CalDAVAuthenticationError("Credenciais inválidas para o servidor CalDAV.")
     """
+
+
+class EventKitError(ICloudError):
+    """Base exception for iCloud Reminders (EventKit) errors.
+
+    Covers operational failures of the native macOS Reminders backend, such as
+    a save/remove that the store rejected, or a reminder/list not found.
+
+    Example:
+        raise EventKitError("Lembrete não encontrado.")
+    """
+
+
+class EventKitAuthorizationError(EventKitError):
+    """Raised when access to Reminders is denied or restricted by macOS (TCC).
+
+    The host process (Claude Desktop, the terminal, or Python itself) must be
+    granted access to Reminders in Ajustes do Sistema → Privacidade e
+    Segurança → Lembretes.
+
+    Example:
+        raise EventKitAuthorizationError("Acesso aos Lembretes negado pelo macOS.")
+    """
+
+
+class EventKitNotAvailableError(EventKitError):
+    """Raised when the EventKit backend is unavailable.
+
+    Typically because the server is running outside macOS, or the PyObjC
+    EventKit bindings are not installed.
+
+    Example:
+        raise EventKitNotAvailableError("EventKit só está disponível no macOS.")
+    """

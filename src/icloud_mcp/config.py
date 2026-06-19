@@ -20,9 +20,12 @@ class ICloudMailSettings(BaseSettings):
         IMAP_POOL_SIZE: Number of persistent IMAP connections to maintain (default 3).
         IMAP_TIMEOUT: Timeout in seconds for IMAP operations (default 30).
         CALDAV_TIMEOUT: Timeout in seconds for CalDAV (Calendar) operations (default 30).
+        EVENTKIT_TIMEOUT: Timeout in seconds for EventKit (Reminders) fetches (default 30).
 
     The same App-Specific Password is used for Mail (IMAP/SMTP) and
     Calendar (CalDAV) — Apple shares the credential across both services.
+    Reminders use the native macOS EventKit API and need no credential — access
+    is granted locally via the macOS Reminders privacy permission.
 
     Example:
         settings = ICloudMailSettings()
@@ -36,6 +39,7 @@ class ICloudMailSettings(BaseSettings):
     imap_pool_size: int = 3
     imap_timeout: int = 30
     caldav_timeout: int = 30
+    eventkit_timeout: int = 30
 
     @property
     def imap_host(self) -> str:

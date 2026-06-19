@@ -82,12 +82,14 @@ def mock_ctx(tmp_path: Path) -> MockCtx:
     smtp_client = AsyncMock()
     rules_engine = RulesEngine(rules_dir=tmp_path)
     caldav_client = AsyncMock()
+    eventkit_client = AsyncMock()
     ctx = MagicMock()
     ctx.request_context.lifespan_context = AppContext(
         imap_client=imap_client,
         smtp_client=smtp_client,
         rules_engine=rules_engine,
         caldav_client=caldav_client,
+        eventkit_client=eventkit_client,
     )
     return ctx, imap_client, smtp_client, rules_engine
 
@@ -391,22 +393,27 @@ async def test_lifespan_init_and_close() -> None:
 
     mock_rules: Any = MagicMock()
     mock_caldav = AsyncMock()
+    mock_eventkit = AsyncMock()
 
     with patch("icloud_mcp.server.get_settings", return_value=mock_settings):
         with patch("icloud_mcp.server.IMAPConnectionPool", return_value=mock_pool):
             with patch("icloud_mcp.server.SMTPClient", return_value=mock_smtp_client):
                 with patch("icloud_mcp.server.RulesEngine", return_value=mock_rules):
                     with patch("icloud_mcp.server.CalDAVClient", return_value=mock_caldav):
-                        async with app_lifespan(mcp) as ctx:
-                            mock_pool.initialize.assert_called_once()
-                            mock_caldav.connect.assert_called_once()
-                            assert isinstance(ctx.imap_client, IMAPClient)
-                            assert ctx.smtp_client is mock_smtp_client
-                            assert ctx.rules_engine is mock_rules
-                            assert ctx.caldav_client is mock_caldav
+                        with patch("icloud_mcp.server.EventKitClient", return_value=mock_eventkit):
+                            async with app_lifespan(mcp) as ctx:
+                                mock_pool.initialize.assert_called_once()
+                                mock_caldav.connect.assert_called_once()
+                                mock_eventkit.connect.assert_called_once()
+                                assert isinstance(ctx.imap_client, IMAPClient)
+                                assert ctx.smtp_client is mock_smtp_client
+                                assert ctx.rules_engine is mock_rules
+                                assert ctx.caldav_client is mock_caldav
+                                assert ctx.eventkit_client is mock_eventkit
 
-                    mock_pool.close.assert_called_once()
-                    mock_caldav.close.assert_called_once()
+                        mock_pool.close.assert_called_once()
+                        mock_caldav.close.assert_called_once()
+                        mock_eventkit.close.assert_called_once()
 
 
 async def test_save_draft_tool(
@@ -775,56 +782,60 @@ async def test_delete_occurrence_tool(mock_ctx: MockCtx) -> None:
     )
 
 
-# -- Reminders (CalDAV VTODO) tool handlers --------------------------------
+# -- Reminders (native macOS EventKit) tool handlers -----------------------
+
+
+def _eventkit(ctx: MagicMock) -> AsyncMock:
+    """Extract the AsyncMock EventKitClient from a mock context."""
+    client: AsyncMock = ctx.request_context.lifespan_context.eventkit_client
+    return client
 
 
 async def test_list_reminder_lists_tool(mock_ctx: MockCtx) -> None:
-    """list_reminder_lists delegates to caldav_client and serializes models."""
+    """list_reminder_lists delegates to eventkit_client and serializes models."""
     ctx, *_ = mock_ctx
-    caldav = _caldav(ctx)
-    caldav.list_reminder_lists.return_value = [
-        ReminderList(name="Tasks", url="https://p1/cal/reminders/"),
+    eventkit = _eventkit(ctx)
+    eventkit.list_reminder_lists.return_value = [
+        ReminderList(name="Tasks", identifier="r-tasks"),
     ]
 
     result = await list_reminder_lists(ctx)
 
-    assert result == [
-        {"name": "Tasks", "url": "https://p1/cal/reminders/", "color": None, "read_only": False}
-    ]
-    caldav.list_reminder_lists.assert_called_once()
+    assert result == [{"name": "Tasks", "identifier": "r-tasks", "color": None, "read_only": False}]
+    eventkit.list_reminder_lists.assert_called_once()
 
 
 async def test_list_reminders_tool(mock_ctx: MockCtx) -> None:
     """list_reminders forwards include_completed and serializes reminders."""
     ctx, *_ = mock_ctx
-    caldav = _caldav(ctx)
-    caldav.list_reminders.return_value = [
+    eventkit = _eventkit(ctx)
+    eventkit.list_reminders.return_value = [
         Reminder(uid="t1", list="Tasks", summary="Buy milk"),
     ]
 
     result = await list_reminders(ctx, list="Tasks", include_completed=True)
 
     assert result[0]["uid"] == "t1"
-    caldav.list_reminders.assert_called_once_with(list="Tasks", include_completed=True)
+    eventkit.list_reminders.assert_called_once_with(list="Tasks", include_completed=True)
 
 
 async def test_get_reminder_tool(mock_ctx: MockCtx) -> None:
-    """get_reminder delegates to caldav_client and serializes the reminder."""
+    """get_reminder delegates to eventkit_client and serializes the reminder."""
     ctx, *_ = mock_ctx
-    caldav = _caldav(ctx)
-    caldav.get_reminder.return_value = Reminder(uid="t1", list="Tasks", summary="Buy milk")
+    eventkit = _eventkit(ctx)
+    eventkit.get_reminder.return_value = Reminder(uid="t1", list="Tasks", summary="Buy milk")
 
     result = await get_reminder(ctx, list="Tasks", uid="t1")
 
     assert result["uid"] == "t1"
-    caldav.get_reminder.assert_called_once_with(list="Tasks", uid="t1")
+    eventkit.get_reminder.assert_called_once_with(list="Tasks", uid="t1")
 
 
 async def test_create_reminder_tool(mock_ctx: MockCtx) -> None:
     """create_reminder parses due/start and forwards all fields."""
     ctx, *_ = mock_ctx
-    caldav = _caldav(ctx)
-    caldav.create_reminder.return_value = Reminder(
+    eventkit = _eventkit(ctx)
+    eventkit.create_reminder.return_value = Reminder(
         uid="new", list="Tasks", summary="Pay rent", due=datetime(2026, 7, 1, 9, tzinfo=UTC)
     )
 
@@ -837,7 +848,7 @@ async def test_create_reminder_tool(mock_ctx: MockCtx) -> None:
     )
 
     assert result["uid"] == "new"
-    caldav.create_reminder.assert_called_once_with(
+    eventkit.create_reminder.assert_called_once_with(
         list="Tasks",
         summary="Pay rent",
         due=datetime(2026, 7, 1, 9),
@@ -854,13 +865,13 @@ async def test_create_reminder_tool(mock_ctx: MockCtx) -> None:
 async def test_update_reminder_tool(mock_ctx: MockCtx) -> None:
     """update_reminder forwards only the provided fields (None for the rest)."""
     ctx, *_ = mock_ctx
-    caldav = _caldav(ctx)
-    caldav.update_reminder.return_value = Reminder(uid="t1", list="Tasks", summary="Renamed")
+    eventkit = _eventkit(ctx)
+    eventkit.update_reminder.return_value = Reminder(uid="t1", list="Tasks", summary="Renamed")
 
     result = await update_reminder(ctx, list="Tasks", uid="t1", summary="Renamed")
 
     assert result["summary"] == "Renamed"
-    caldav.update_reminder.assert_called_once_with(
+    eventkit.update_reminder.assert_called_once_with(
         list="Tasks",
         uid="t1",
         summary="Renamed",
@@ -879,55 +890,52 @@ async def test_update_reminder_tool(mock_ctx: MockCtx) -> None:
 async def test_complete_reminder_tool(mock_ctx: MockCtx) -> None:
     """complete_reminder delegates and serializes the completed reminder."""
     ctx, *_ = mock_ctx
-    caldav = _caldav(ctx)
-    caldav.complete_reminder.return_value = Reminder(
+    eventkit = _eventkit(ctx)
+    eventkit.complete_reminder.return_value = Reminder(
         uid="t1", list="Tasks", summary="Buy milk", completed=True
     )
 
     result = await complete_reminder(ctx, list="Tasks", uid="t1")
 
     assert result["completed"] is True
-    caldav.complete_reminder.assert_called_once_with(list="Tasks", uid="t1")
+    eventkit.complete_reminder.assert_called_once_with(list="Tasks", uid="t1")
 
 
 async def test_reopen_reminder_tool(mock_ctx: MockCtx) -> None:
     """reopen_reminder delegates and serializes the reopened reminder."""
     ctx, *_ = mock_ctx
-    caldav = _caldav(ctx)
-    caldav.reopen_reminder.return_value = Reminder(
+    eventkit = _eventkit(ctx)
+    eventkit.reopen_reminder.return_value = Reminder(
         uid="t1", list="Tasks", summary="Buy milk", completed=False
     )
 
     result = await reopen_reminder(ctx, list="Tasks", uid="t1")
 
     assert result["completed"] is False
-    caldav.reopen_reminder.assert_called_once_with(list="Tasks", uid="t1")
+    eventkit.reopen_reminder.assert_called_once_with(list="Tasks", uid="t1")
 
 
 async def test_delete_reminder_tool(mock_ctx: MockCtx) -> None:
-    """delete_reminder delegates to caldav_client and returns its status dict."""
+    """delete_reminder delegates to eventkit_client and returns its status dict."""
     ctx, *_ = mock_ctx
-    caldav = _caldav(ctx)
-    caldav.delete_reminder.return_value = {"status": "deleted", "uid": "t1"}
+    eventkit = _eventkit(ctx)
+    eventkit.delete_reminder.return_value = {"status": "deleted", "uid": "t1"}
 
     result = await delete_reminder(ctx, list="Tasks", uid="t1")
 
     assert result == {"status": "deleted", "uid": "t1"}
-    caldav.delete_reminder.assert_called_once_with(list="Tasks", uid="t1")
-
-
-# -- Reminders Phase 1 tool handlers ---------------------------------------
+    eventkit.delete_reminder.assert_called_once_with(list="Tasks", uid="t1")
 
 
 async def test_update_reminder_tool_forwards_clear(mock_ctx: MockCtx) -> None:
     """update_reminder forwards the clear list to the client."""
     ctx, *_ = mock_ctx
-    caldav = _caldav(ctx)
-    caldav.update_reminder.return_value = Reminder(uid="t1", list="Tasks", summary="x")
+    eventkit = _eventkit(ctx)
+    eventkit.update_reminder.return_value = Reminder(uid="t1", list="Tasks", summary="x")
 
     await update_reminder(ctx, list="Tasks", uid="t1", clear=["due", "priority"])
 
-    caldav.update_reminder.assert_called_once_with(
+    eventkit.update_reminder.assert_called_once_with(
         list="Tasks",
         uid="t1",
         summary=None,
@@ -946,60 +954,58 @@ async def test_update_reminder_tool_forwards_clear(mock_ctx: MockCtx) -> None:
 async def test_move_reminder_tool(mock_ctx: MockCtx) -> None:
     """move_reminder delegates uid/from_list/to_list and serializes the result."""
     ctx, *_ = mock_ctx
-    caldav = _caldav(ctx)
-    caldav.move_reminder.return_value = Reminder(uid="t1", list="Personal", summary="x")
+    eventkit = _eventkit(ctx)
+    eventkit.move_reminder.return_value = Reminder(uid="t1", list="Personal", summary="x")
 
     result = await move_reminder(ctx, uid="t1", from_list="Tasks", to_list="Personal")
 
     assert result["list"] == "Personal"
-    caldav.move_reminder.assert_called_once_with(uid="t1", from_list="Tasks", to_list="Personal")
+    eventkit.move_reminder.assert_called_once_with(uid="t1", from_list="Tasks", to_list="Personal")
 
 
 async def test_create_reminder_list_tool(mock_ctx: MockCtx) -> None:
     """create_reminder_list delegates name/color and serializes the list."""
     ctx, *_ = mock_ctx
-    caldav = _caldav(ctx)
-    caldav.create_reminder_list.return_value = ReminderList(
-        name="Groceries", url="https://p1/cal/groceries/", color="#00FF00"
+    eventkit = _eventkit(ctx)
+    eventkit.create_reminder_list.return_value = ReminderList(
+        name="Groceries", identifier="r-groc", color="#00FF00"
     )
 
     result = await create_reminder_list(ctx, name="Groceries", color="#00FF00")
 
     assert result["name"] == "Groceries"
-    caldav.create_reminder_list.assert_called_once_with(name="Groceries", color="#00FF00")
+    eventkit.create_reminder_list.assert_called_once_with(name="Groceries", color="#00FF00")
 
 
 async def test_rename_reminder_list_tool(mock_ctx: MockCtx) -> None:
     """rename_reminder_list delegates name/new_name and serializes the list."""
     ctx, *_ = mock_ctx
-    caldav = _caldav(ctx)
-    caldav.rename_reminder_list.return_value = ReminderList(
-        name="To Do", url="https://p1/cal/reminders/"
-    )
+    eventkit = _eventkit(ctx)
+    eventkit.rename_reminder_list.return_value = ReminderList(name="To Do", identifier="r-tasks")
 
     result = await rename_reminder_list(ctx, name="Tasks", new_name="To Do")
 
     assert result["name"] == "To Do"
-    caldav.rename_reminder_list.assert_called_once_with(name="Tasks", new_name="To Do")
+    eventkit.rename_reminder_list.assert_called_once_with(name="Tasks", new_name="To Do")
 
 
 async def test_delete_reminder_list_tool(mock_ctx: MockCtx) -> None:
     """delete_reminder_list forwards confirm and returns its status dict."""
     ctx, *_ = mock_ctx
-    caldav = _caldav(ctx)
-    caldav.delete_reminder_list.return_value = {"status": "deleted_list", "list": "Tasks"}
+    eventkit = _eventkit(ctx)
+    eventkit.delete_reminder_list.return_value = {"status": "deleted_list", "list": "Tasks"}
 
     result = await delete_reminder_list(ctx, name="Tasks", confirm=True)
 
     assert result == {"status": "deleted_list", "list": "Tasks"}
-    caldav.delete_reminder_list.assert_called_once_with(name="Tasks", confirm=True)
+    eventkit.delete_reminder_list.assert_called_once_with(name="Tasks", confirm=True)
 
 
 async def test_search_reminders_tool(mock_ctx: MockCtx) -> None:
     """search_reminders parses date bounds and forwards all filters."""
     ctx, *_ = mock_ctx
-    caldav = _caldav(ctx)
-    caldav.search_reminders.return_value = [
+    eventkit = _eventkit(ctx)
+    eventkit.search_reminders.return_value = [
         Reminder(uid="t1", list="Tasks", summary="Overdue", due=datetime(2026, 6, 10, tzinfo=UTC)),
     ]
 
@@ -1008,7 +1014,7 @@ async def test_search_reminders_tool(mock_ctx: MockCtx) -> None:
     )
 
     assert result[0]["uid"] == "t1"
-    caldav.search_reminders.assert_called_once_with(
+    eventkit.search_reminders.assert_called_once_with(
         query=None,
         due_before=datetime(2026, 6, 18),
         due_after=None,

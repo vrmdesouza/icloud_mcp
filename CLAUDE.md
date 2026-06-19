@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-`icloud_mcp` (the "iCloud MCP" server) is a Python MCP (Model Context Protocol) server that connects Claude to iCloud. It exposes tools for **Mail** (reading, searching, sending emails, managing folders) over IMAP/SMTP using a persistent IMAP connection pool, for **Calendar** (viewing, creating, editing, deleting events) over CalDAV (`VEVENT`), and for **Reminders** (viewing, creating, editing, completing, deleting tasks) over CalDAV (`VTODO`).
+`icloud_mcp` (the "iCloud MCP" server) is a Python MCP (Model Context Protocol) server that connects Claude to iCloud. It exposes tools for **Mail** (reading, searching, sending emails, managing folders) over IMAP/SMTP using a persistent IMAP connection pool, for **Calendar** (viewing, creating, editing, deleting events) over CalDAV (`VEVENT`), and for **Reminders** (viewing, creating, editing, completing, deleting tasks) via the **native macOS Reminders app** through EventKit (PyObjC).
+
+> **Why EventKit for Reminders, not CalDAV?** Since iOS 13 / macOS Catalina, the Reminders app migrates tasks off CalDAV into a private store that only the local Reminders app (and EventKit) can read. On upgraded accounts CalDAV `VTODO` only ever sees the empty "Reminders ⚠️" placeholder list — so Reminders are served locally via EventKit instead. This requires the server to run on macOS with the Reminders privacy permission granted. Mail and Calendar are unaffected.
 
 ## Development Commands
 
@@ -56,6 +58,7 @@ Optional configuration variables:
 | `IMAP_POOL_SIZE` | `3` | Number of persistent IMAP connections in the pool |
 | `IMAP_TIMEOUT` | `30` | Timeout in seconds for IMAP operations |
 | `CALDAV_TIMEOUT` | `30` | Timeout in seconds for CalDAV (Calendar) operations |
+| `EVENTKIT_TIMEOUT` | `30` | Timeout in seconds for EventKit (Reminders) fetch/authorization |
 
 > An **App-Specific Password** must be generated at appleid.apple.com (requires 2FA) — the regular Apple ID password does not work with IMAP/SMTP/CalDAV.
 
@@ -65,6 +68,7 @@ iCloud server endpoints:
 - **IMAP**: `imap.mail.me.com:993` (SSL/TLS)
 - **SMTP**: `smtp.mail.me.com:587` (STARTTLS)
 - **CalDAV**: `caldav.icloud.com:443` (HTTPS) — the per-account calendar-home-set is discovered at runtime on a partition host (e.g. `p67-caldav.icloud.com`).
+- **Reminders**: no network endpoint — served locally by the macOS Reminders app via EventKit. Requires the Reminders privacy permission (Ajustes do Sistema → Privacidade e Segurança → Lembretes) for the host process (Claude Desktop, or the terminal when running via `uv run`). The first call triggers the system prompt.
 
 ## Code Conventions
 
@@ -76,6 +80,7 @@ iCloud server endpoints:
   - `IMAPAuthenticationError` — login/credential failures
   - `SMTPSendError` — send failures
   - `CalDAVError` / `CalDAVConnectionError` / `CalDAVAuthenticationError` — Calendar errors
+  - `EventKitError` / `EventKitAuthorizationError` / `EventKitNotAvailableError` — Reminders errors
   - All inherit from a base `ICloudError` (`ICloudMailError` remains as a backward-compatible alias)
 
 ## Architecture
@@ -88,6 +93,8 @@ src/icloud_mcp/
 ├── imap_client.py    # Persistent IMAP connection pool — all read/search/folder ops
 ├── smtp_client.py    # SMTP client — creates connection per send operation
 ├── caldav_client.py  # Async CalDAV client (httpx) — Calendar discovery + event CRUD
+├── eventkit_store.py # Native Reminders backend (PyObjC/EventKit) — the only PyObjC layer
+├── eventkit_client.py# Reminders orchestration over a ReminderStore (pure Python)
 ├── rules.py          # Local JSON-backed mail filtering rules engine
 └── models.py         # Pydantic models: Email, Folder, Calendar, CalendarEvent, ReminderList, Reminder, etc.
 
@@ -95,7 +102,9 @@ tests/
 ├── conftest.py       # Shared fixtures (mock IMAP/SMTP connections)
 ├── test_imap_client.py
 ├── test_smtp_client.py
-├── test_caldav_client.py  # CalDAV client tests (httpx.MockTransport, no network)
+├── test_caldav_client.py    # CalDAV client tests (httpx.MockTransport, no network)
+├── test_eventkit_client.py  # Reminders orchestration vs an in-memory FakeReminderStore
+├── test_eventkit_store.py   # Live EventKit round-trip (gated: macOS + ICLOUD_MCP_LIVE_EVENTKIT=1)
 └── test_server.py    # Tests for MCP tool handlers
 ```
 
@@ -113,7 +122,12 @@ tests/
 
 **CalDAV is stateless** (`caldav_client.py`): No connection pool. A single `httpx.AsyncClient` carries Basic Auth across requests. At startup, `connect()` runs the two-step iCloud discovery (`current-user-principal` → `calendar-home-set`) and caches the resulting partition-host URL. Events are addressed by `href`/`ETag` we track ourselves, sidestepping iCloud's broken `get_object_by_uid`. Attendees and alarms are intentionally out of scope for v1.
 
-**Reminders share the CalDAV client** (`caldav_client.py`): iCloud Reminders lists are CalDAV collections under the **same** `calendar-home-set`, distinguished by a `supported-calendar-component-set` that advertises `VTODO` instead of `VEVENT`. `list_calendars()` filters these out (`_supports_vevent`); `list_reminder_lists()` keeps exactly them (`_supports_vtodo`). Reminders reuse all the existing HTTP plumbing, discovery, retry, and `If-Match`/`If-None-Match` concurrency. A reminder *with* a `DUE` is a deadline task (it shows on the calendar timeline); *without* `DUE` it is a plain task — both are read/written identically. Completion is `STATUS:COMPLETED` + `COMPLETED` + `PERCENT-COMPLETE`. Update/complete/reopen mutate the fetched resource in place (rather than rebuilding from a model) so unmodeled properties survive. Reminders support recurrence (`RRULE`, see below), display alarms (`VALARM`), cross-list search, list management (`MKCALENDAR`/`PROPPATCH`), and moving between lists. **Out of scope:** subtasks (`RELATED-TO` — pending validation that iCloud syncs the hierarchy over CalDAV) and iCloud-proprietary features that don't traverse CalDAV (tags, smart lists, attachments, location/messaging triggers).
+**Reminders use a native EventKit backend** (`eventkit_store.py` + `eventkit_client.py`): Reminders are served by the local macOS Reminders app through EventKit (PyObjC), split into two layers behind a `ReminderStore` protocol:
+
+- **`eventkit_store.py` — `EventKitStore`**: the *only* place that touches PyObjC / `EKEventStore`. It requests Reminders authorization on `connect()` (bridging EventKit's completion-handler APIs to a synchronous result via `threading.Event`, all run off the event loop with `asyncio.to_thread`), lists `EKCalendar`s of the reminders entity type, fetches via `predicateForRemindersInCalendars:`/`fetchRemindersMatchingPredicate:completion:`, and converts `EKReminder ↔ Reminder` (dates ↔ `NSDateComponents`, `RRULE ↔ EKRecurrenceRule`, alarms ↔ `EKAlarm`). The reminder UID is `calendarItemExternalIdentifier` (the stable iCalendar UID); lookups scan the lists (small) to match it.
+- **`eventkit_client.py` — `EventKitClient`**: pure-Python orchestration over a `ReminderStore` — list resolution by display name, completed filtering, due-date sorting, cross-list search, partial-update merging, and `clear` semantics. It holds no PyObjC, so it is unit-tested against an in-memory `FakeReminderStore` on any platform. `server.py` delegates the reminder tools here.
+
+A reminder *with* a `due` is a deadline task; *without* it is a plain task — both are read/written identically. **Update** merges partial changes onto the current reminder and writes the full desired state back; the store mutates the fetched `EKReminder` in place, so unmodeled native properties (location, `X-APPLE-…`) survive. **Completion** only toggles `isCompleted` so EventKit's native advance of recurring tasks is preserved (see below). **Move** sets the reminder's `calendar` and saves, preserving identity. **Priority** uses the same 0–9 iCalendar scale EventKit exposes. **Out of scope:** subtasks and iCloud-proprietary features EventKit doesn't surface (tags, smart lists).
 
 **Config validation** (`config.py`): Reads env vars at startup and fails fast with a clear error if required vars are missing. Use `pydantic-settings` for this.
 
@@ -136,6 +150,12 @@ tests/
 - **Auth**: HTTP 401 raises `CalDAVAuthenticationError` immediately (no retry) — usually a regular password used where an App-Specific Password belongs.
 - **Exceptions**: Other 4xx raise `CalDAVError`; exhausted retries raise `CalDAVConnectionError`.
 
+### EventKit (Reminders)
+
+- **Authorization**: `EventKitStore.connect()` requests Reminders access; a denial/restriction raises `EventKitAuthorizationError` (with PT-BR guidance on granting it). The lifespan logs a warning and keeps Mail/Calendar working if Reminders are unavailable.
+- **Availability**: constructing `EventKitStore` off macOS (or without the PyObjC bindings) raises `EventKitNotAvailableError`.
+- **Exceptions**: a save/remove the store rejects, or a missing reminder/list, raises `EventKitError`.
+
 ### Exception Hierarchy
 
 ```python
@@ -147,6 +167,9 @@ class SMTPSendError(ICloudError): ...
 class CalDAVError(ICloudError): ...
 class CalDAVConnectionError(CalDAVError): ...
 class CalDAVAuthenticationError(CalDAVError): ...
+class EventKitError(ICloudError): ...
+class EventKitAuthorizationError(EventKitError): ...
+class EventKitNotAvailableError(EventKitError): ...
 ```
 
 ## MCP Tools
@@ -185,36 +208,36 @@ iCloud's server-side `expand` is unreliable, so recurrence is expanded **client-
 - `create_event`/`update_event` accept a raw `rrule` (e.g. `"FREQ=WEEKLY;BYDAY=MO"`), validated before the `PUT`. They operate on the **whole series**.
 - **Single occurrence**: `update_occurrence` adds/updates a `RECURRENCE-ID` override inside the same resource; `delete_occurrence` adds an `EXDATE` to the master (and drops any override for that slot). Both address the occurrence by `recurrence_id` (the original slot, as returned by `list_events`), validate it against the series, and PUT the whole resource with `If-Match`. The `RECURRENCE-ID`/`EXDATE` value type (date vs datetime) is derived from the master's `DTSTART`. **Out of scope:** "this and future" (`THISANDFUTURE`).
 
-### Reminder Tools (CalDAV `VTODO`)
+### Reminder Tools (native macOS EventKit)
 
 | Tool | Parameters | Return | Description |
 |------|------------|--------|-------------|
-| `list_reminder_lists` | — | `list[ReminderList]` | List Reminders lists (collections that support `VTODO`) |
+| `list_reminder_lists` | — | `list[ReminderList]` | List Reminders lists (`EKCalendar`s of the reminders entity type) |
 | `list_reminders` | `list: str`, `include_completed: bool = False` | `list[Reminder]` | Tasks in a list, ordered by `due` (undated last). Hides completed by default |
 | `search_reminders` | `query: str?`, `due_before: str?`, `due_after: str?`, `include_completed: bool = False`, `undated: bool = True`, `lists: list[str]?` | `list[Reminder]` | Search **across all lists** (or a subset), ordered by `due`. Presets: overdue (`due_before=now`, `undated=False`), due today (`due_before`=end of today, `undated=False`), free-text (`query`). Lists fetched concurrently |
-| `get_reminder` | `list: str`, `uid: str` | `Reminder` | Fetch a single reminder by iCalendar UID |
-| `create_reminder` | `list: str`, `summary: str`, `due: str?`, `start: str?`, `all_day: bool = False`, `priority: int?`, `description: str?`, `url: str?`, `rrule: str?`, `alarms: list[dict]?` | `Reminder` | Create a task; omit `due` for a task without a deadline. Pass `rrule` for a recurring task, `alarms` for `VALARM`s |
+| `get_reminder` | `list: str`, `uid: str` | `Reminder` | Fetch a single reminder by UID (`calendarItemExternalIdentifier`) |
+| `create_reminder` | `list: str`, `summary: str`, `due: str?`, `start: str?`, `all_day: bool = False`, `priority: int?`, `description: str?`, `url: str?`, `rrule: str?`, `alarms: list[dict]?` | `Reminder` | Create a task; omit `due` for a task without a deadline. Pass `rrule` for a recurring task, `alarms` for `EKAlarm`s |
 | `update_reminder` | `list: str`, `uid: str`, + optional `summary`/`due`/`start`/`all_day`/`priority`/`description`/`url`/`rrule`/`alarms`, `clear: list[str]?` | `Reminder` | Update the provided fields. `rrule=""` removes recurrence; `alarms` (any list, incl. `[]`) replaces all alarms. `clear` unsets fields entirely (`due`/`start`/`description`/`url`/`priority`) |
-| `complete_reminder` | `list: str`, `uid: str` | `Reminder` | Mark a task completed (`STATUS:COMPLETED`) |
-| `reopen_reminder` | `list: str`, `uid: str` | `Reminder` | Reopen a completed task (`STATUS:NEEDS-ACTION`) |
+| `complete_reminder` | `list: str`, `uid: str` | `Reminder` | Mark a task completed (sets `isCompleted`; recurring tasks advance natively) |
+| `reopen_reminder` | `list: str`, `uid: str` | `Reminder` | Reopen a completed task (clears `isCompleted`) |
 | `delete_reminder` | `list: str`, `uid: str` | `dict` | Delete a task by UID |
-| `move_reminder` | `uid: str`, `from_list: str`, `to_list: str` | `Reminder` | Move a task between lists (copy to destination + delete original; all properties preserved) |
-| `create_reminder_list` | `name: str`, `color: str?` | `ReminderList` | Create a new list (`MKCALENDAR` with `VTODO` component set) |
-| `rename_reminder_list` | `name: str`, `new_name: str` | `ReminderList` | Rename a list (`PROPPATCH` of `displayname`) |
+| `move_reminder` | `uid: str`, `from_list: str`, `to_list: str` | `Reminder` | Move a task between lists (sets its `calendar`; identity preserved) |
+| `create_reminder_list` | `name: str`, `color: str?` | `ReminderList` | Create a new list (a reminders-type `EKCalendar`) |
+| `rename_reminder_list` | `name: str`, `new_name: str` | `ReminderList` | Rename a list (`EKCalendar.title`) |
 | `delete_reminder_list` | `name: str`, `confirm: bool = False` | `dict` | Delete a list **and all its tasks**; requires `confirm=True` |
 
-`priority` follows iCalendar: 0 = none, 1–4 = high, 5 = medium, 6–9 = low. `created`/`modified` (from `CREATED`/`LAST-MODIFIED`) are exposed read-only on `Reminder`.
+`priority` follows iCalendar (EventKit uses the same scale): 0 = none, 1–4 = high, 5 = medium, 6–9 = low. `created`/`modified` (from `creationDate`/`lastModifiedDate`) are exposed read-only on `Reminder`.
 
 #### Recurring reminders
 
-Unlike events, recurring reminders are **never expanded into many rows** — a recurring task is one `Reminder` carrying its `rrule`/`is_recurring`. Instead:
-- `list_reminders`/`search_reminders` roll a recurring task's `due` forward to its **next occurrence ≥ now** (computed with `dateutil.rrule`; if the rule is exhausted the stored due is kept). `get_reminder` returns the stored master `due` unchanged.
-- `complete_reminder` on a recurring task **advances it to the next occurrence** (`DUE`/`DTSTART` shifted, kept `NEEDS-ACTION`) instead of completing the series — matching task-app behavior. Only when the series is exhausted is it marked `COMPLETED`.
-- **Caveats (best-effort, validate against real iCloud):** advancing re-anchors the rule at the current `due`, so `COUNT`/`UNTIL` semantics are approximate across many completions; the advance-on-complete behavior itself should be confirmed against a live account (iCloud may differ).
+A recurring task is one `Reminder` carrying its `rrule`/`is_recurring` — never expanded into many rows. With EventKit the stored `due` already reflects the **current** occurrence (the system advances it natively), so `list_reminders`/`search_reminders`/`get_reminder` all return `due` as-is; there is no client-side roll-forward.
+- `complete_reminder` on a recurring task only sets `isCompleted` and saves — **EventKit/Reminders.app advances the task to its next occurrence natively** (matching task-app behavior). We do not simulate the advance.
+- `rrule` is converted to/from `EKRecurrenceRule` for the common subset (`FREQ`/`INTERVAL`/`BYDAY`/`COUNT`/`UNTIL`); exotic rules (e.g. `BYSETPOS`) are best-effort and may be lossy.
+- **Caveat (validate against a real account):** the native advance-on-complete behavior is the Reminders app's, which is the reference — confirm with the gated live test (`test_eventkit_store.py`).
 
-#### Alarms (`VALARM`)
+#### Alarms
 
-`Reminder.alarms` is a list of `ReminderAlarm`, each carrying exactly one of `minutes_before` (relative `TRIGGER;RELATED=END` before the due) or `trigger` (absolute `TRIGGER;VALUE=DATE-TIME`). `create_reminder`/`update_reminder` accept `alarms` as a list of dicts (`{"minutes_before": 30}` or `{"trigger": "2026-07-01T08:00:00"}`); on `update_reminder`, `alarms=None` keeps the existing alarms while any list (including `[]`) replaces them all. We write standard `DISPLAY` alarms — iCloud may attach proprietary `X-APPLE-…` parameters, which survive via the in-place mutation on update.
+`Reminder.alarms` is a list of `ReminderAlarm`, each carrying exactly one of `minutes_before` (a relative `EKAlarm`, fired before the due) or `trigger` (an absolute `EKAlarm`). `create_reminder`/`update_reminder` accept `alarms` as a list of dicts (`{"minutes_before": 30}` or `{"trigger": "2026-07-01T08:00:00"}`); on `update_reminder`, `alarms=None` keeps the existing alarms while any list (including `[]`) replaces them all.
 
 ### Pagination (`list_emails`)
 
@@ -269,9 +292,9 @@ testpaths = ["tests"]
 - `aioimaplib` — async IMAP4 client
 - `aiosmtplib` — async SMTP client
 - `httpx` — async HTTP client (CalDAV transport)
-- `icalendar` — build/parse iCalendar (`VEVENT`) documents
+- `icalendar` — build/parse iCalendar (`VEVENT`) documents; also parses `RRULE` strings for EventKit recurrence conversion
 - `recurring-ical-events` — client-side expansion of recurring events (`RRULE`/`EXDATE`/`RECURRENCE-ID`)
-- `python-dateutil` — `rrule` computation for recurring reminders' next occurrence
+- `pyobjc-framework-EventKit` — native macOS Reminders access (macOS only; `sys_platform == 'darwin'`)
 - `pydantic-settings` — env var loading with validation
 - `python-dotenv` — `.env` file support in development
 - `ruff`, `mypy`, `pytest`, `pytest-asyncio` — dev dependencies

@@ -11,6 +11,8 @@ from mcp.server.fastmcp import Context, FastMCP
 
 from icloud_mcp.caldav_client import CalDAVClient
 from icloud_mcp.config import get_settings
+from icloud_mcp.eventkit_client import EventKitClient
+from icloud_mcp.exceptions import EventKitError
 from icloud_mcp.imap_client import IMAPClient, IMAPConnectionPool
 from icloud_mcp.models import ReminderAlarm, SearchQuery
 from icloud_mcp.rules import RulesEngine
@@ -27,30 +29,44 @@ class AppContext:
     smtp_client: SMTPClient
     rules_engine: RulesEngine
     caldav_client: CalDAVClient
+    eventkit_client: EventKitClient
 
 
 @asynccontextmanager
 async def app_lifespan(app: FastMCP[AppContext]) -> AsyncIterator[AppContext]:
-    """Initialize the IMAP pool and CalDAV client, wiring up clients on start."""
+    """Initialize the IMAP pool, CalDAV client, and EventKit Reminders client."""
     settings = get_settings()
     pool = IMAPConnectionPool(settings)
     log.info("Inicializando pool de conexões IMAP...")
     await pool.initialize()
     log.info("Pool IMAP inicializado com %d conexões.", settings.imap_pool_size)
     caldav_client = CalDAVClient(settings)
+    eventkit_client = EventKitClient(settings)
     try:
         log.info("Descobrindo serviço CalDAV do iCloud...")
         await caldav_client.connect()
+        log.info("Solicitando acesso aos Lembretes via EventKit...")
+        try:
+            await eventkit_client.connect()
+            log.info("Acesso aos Lembretes concedido.")
+        except EventKitError as exc:
+            # Mail and Calendar still work without Reminders; degrade gracefully.
+            log.warning(
+                "Lembretes indisponíveis via EventKit (as demais ferramentas seguem ativas): %s",
+                exc,
+            )
         yield AppContext(
             imap_client=IMAPClient(pool),
             smtp_client=SMTPClient(settings),
             rules_engine=RulesEngine(),
             caldav_client=caldav_client,
+            eventkit_client=eventkit_client,
         )
     finally:
-        log.info("Encerrando pool de conexões IMAP e cliente CalDAV...")
+        log.info("Encerrando pool de conexões IMAP e clientes CalDAV/EventKit...")
         await pool.close()
         await caldav_client.close()
+        await eventkit_client.close()
 
 
 mcp: FastMCP[AppContext] = FastMCP("icloud-mcp", lifespan=app_lifespan)
@@ -617,14 +633,14 @@ async def delete_occurrence(
     )
 
 
-# -- Reminders (CalDAV VTODO) ----------------------------------------------
+# -- Reminders (native macOS EventKit) -------------------------------------
 
 
 @mcp.tool()
 async def list_reminder_lists(ctx: Context) -> list[dict[str, Any]]:  # type: ignore[type-arg]
-    """List all iCloud Reminders lists (CalDAV VTODO collections)."""
+    """List all iCloud Reminders lists (native macOS Reminders lists)."""
     app = _get_ctx(ctx)
-    lists = await app.caldav_client.list_reminder_lists()
+    lists = await app.eventkit_client.list_reminder_lists()
     return [r.model_dump() for r in lists]
 
 
@@ -641,7 +657,7 @@ async def list_reminders(
         include_completed: When False (default), completed tasks are hidden.
     """
     app = _get_ctx(ctx)
-    reminders = await app.caldav_client.list_reminders(
+    reminders = await app.eventkit_client.list_reminders(
         list=list, include_completed=include_completed
     )
     return [r.model_dump(mode="json") for r in reminders]
@@ -671,7 +687,7 @@ async def search_reminders(
         lists: Restrict to these list names; None searches every list.
     """
     app = _get_ctx(ctx)
-    reminders = await app.caldav_client.search_reminders(
+    reminders = await app.eventkit_client.search_reminders(
         query=query,
         due_before=_parse_datetime(due_before, "due_before") if due_before else None,
         due_after=_parse_datetime(due_after, "due_after") if due_after else None,
@@ -686,7 +702,7 @@ async def search_reminders(
 async def get_reminder(ctx: Context, list: str, uid: str) -> dict[str, Any]:  # type: ignore[type-arg]
     """Fetch a single reminder by its iCalendar UID."""
     app = _get_ctx(ctx)
-    reminder = await app.caldav_client.get_reminder(list=list, uid=uid)
+    reminder = await app.eventkit_client.get_reminder(list=list, uid=uid)
     return reminder.model_dump(mode="json")
 
 
@@ -721,7 +737,7 @@ async def create_reminder(
             "minutes_before" (int, before the due) or "trigger" (absolute ISO 8601).
     """
     app = _get_ctx(ctx)
-    reminder = await app.caldav_client.create_reminder(
+    reminder = await app.eventkit_client.create_reminder(
         list=list,
         summary=summary,
         due=_parse_datetime(due, "due") if due is not None else None,
@@ -766,7 +782,7 @@ async def update_reminder(
             "description", "url", "priority") — e.g. to remove a deadline.
     """
     app = _get_ctx(ctx)
-    reminder = await app.caldav_client.update_reminder(
+    reminder = await app.eventkit_client.update_reminder(
         list=list,
         uid=uid,
         summary=summary,
@@ -787,7 +803,7 @@ async def update_reminder(
 async def complete_reminder(ctx: Context, list: str, uid: str) -> dict[str, Any]:  # type: ignore[type-arg]
     """Mark a reminder as completed."""
     app = _get_ctx(ctx)
-    reminder = await app.caldav_client.complete_reminder(list=list, uid=uid)
+    reminder = await app.eventkit_client.complete_reminder(list=list, uid=uid)
     return reminder.model_dump(mode="json")
 
 
@@ -795,7 +811,7 @@ async def complete_reminder(ctx: Context, list: str, uid: str) -> dict[str, Any]
 async def reopen_reminder(ctx: Context, list: str, uid: str) -> dict[str, Any]:  # type: ignore[type-arg]
     """Reopen a completed reminder (back to needs-action)."""
     app = _get_ctx(ctx)
-    reminder = await app.caldav_client.reopen_reminder(list=list, uid=uid)
+    reminder = await app.eventkit_client.reopen_reminder(list=list, uid=uid)
     return reminder.model_dump(mode="json")
 
 
@@ -803,7 +819,7 @@ async def reopen_reminder(ctx: Context, list: str, uid: str) -> dict[str, Any]: 
 async def delete_reminder(ctx: Context, list: str, uid: str) -> dict[str, str]:  # type: ignore[type-arg]
     """Delete a reminder by its iCalendar UID."""
     app = _get_ctx(ctx)
-    return await app.caldav_client.delete_reminder(list=list, uid=uid)
+    return await app.eventkit_client.delete_reminder(list=list, uid=uid)
 
 
 @mcp.tool()
@@ -815,7 +831,9 @@ async def move_reminder(
 ) -> dict[str, Any]:
     """Move a reminder from one list to another (preserves all its fields)."""
     app = _get_ctx(ctx)
-    reminder = await app.caldav_client.move_reminder(uid=uid, from_list=from_list, to_list=to_list)
+    reminder = await app.eventkit_client.move_reminder(
+        uid=uid, from_list=from_list, to_list=to_list
+    )
     return reminder.model_dump(mode="json")
 
 
@@ -832,7 +850,7 @@ async def create_reminder_list(
         color: Optional hex color (e.g. "#FF0000").
     """
     app = _get_ctx(ctx)
-    rlist = await app.caldav_client.create_reminder_list(name=name, color=color)
+    rlist = await app.eventkit_client.create_reminder_list(name=name, color=color)
     return rlist.model_dump()
 
 
@@ -840,7 +858,7 @@ async def create_reminder_list(
 async def rename_reminder_list(ctx: Context, name: str, new_name: str) -> dict[str, Any]:  # type: ignore[type-arg]
     """Rename an existing Reminders list."""
     app = _get_ctx(ctx)
-    rlist = await app.caldav_client.rename_reminder_list(name=name, new_name=new_name)
+    rlist = await app.eventkit_client.rename_reminder_list(name=name, new_name=new_name)
     return rlist.model_dump()
 
 
@@ -857,4 +875,4 @@ async def delete_reminder_list(
         confirm: Must be True to proceed — this is destructive and irreversible.
     """
     app = _get_ctx(ctx)
-    return await app.caldav_client.delete_reminder_list(name=name, confirm=confirm)
+    return await app.eventkit_client.delete_reminder_list(name=name, confirm=confirm)
