@@ -1,20 +1,23 @@
 """MCP server wiring: tool registration, lifespan, and client orchestration."""
 
 import logging
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import date, datetime
+from html.parser import HTMLParser
 from typing import Any
 
 from mcp.server.fastmcp import Context, FastMCP
+from pydantic import BaseModel
 
 from icloud_mcp.caldav_client import CalDAVClient
 from icloud_mcp.config import get_settings
 from icloud_mcp.eventkit_client import EventKitClient
 from icloud_mcp.exceptions import EventKitError
 from icloud_mcp.imap_client import IMAPClient, IMAPConnectionPool
-from icloud_mcp.models import ReminderAlarm, SearchQuery
+from icloud_mcp.models import Email, ReminderAlarm, SearchQuery
 from icloud_mcp.rules import RulesEngine
 from icloud_mcp.smtp_client import SMTPClient
 
@@ -78,12 +81,154 @@ def _get_ctx(ctx: Context) -> AppContext:  # type: ignore[type-arg]
     return lc
 
 
+def _is_empty(value: Any) -> bool:
+    """Whether a serialized value carries no information (``None``/empty container).
+
+    Meaningful falsy values (``False``, ``0``) are *not* considered empty — only
+    ``None``, empty strings, empty lists and empty dicts are.
+    """
+    return value is None or value == "" or value == [] or value == {}
+
+
+def _compact(value: Any) -> Any:
+    """Recursively drop ``None``, empty strings and empty collections.
+
+    Tool outputs are serialized Pydantic models that include every field, even
+    the absent ones (``"body_html": ""``, ``"cc": []``, ``"message_id": null``).
+    Those empty fields carry no signal to the model but still cost tokens on
+    every call, so omitting them shrinks each payload without losing any
+    information. Meaningful ``False``/``0`` values are preserved.
+    """
+    if isinstance(value, dict):
+        compacted = {k: _compact(v) for k, v in value.items()}
+        return {k: v for k, v in compacted.items() if not _is_empty(v)}
+    if isinstance(value, list):
+        return [_compact(v) for v in value]
+    return value
+
+
+def _dump(model: BaseModel, *, exclude: set[str] | None = None) -> dict[str, Any]:
+    """Serialize a model to a compact, token-lean dict for tool output.
+
+    Wraps ``model_dump(mode="json")`` and strips empty fields via ``_compact``.
+    ``exclude`` drops named fields entirely (used for internal plumbing such as
+    a calendar event's ``href``/``etag`` that the model never receives back).
+    """
+    data: dict[str, Any] = _compact(model.model_dump(mode="json", exclude=exclude))
+    return data
+
+
+# Internal CalDAV concurrency plumbing the model tracks itself; the client
+# addresses events by ``uid``/``recurrence_id``, so these never need to reach
+# the model and only bloat every event payload.
+_EVENT_INTERNAL_FIELDS = {"href", "etag"}
+
+
+class _HTMLToText(HTMLParser):
+    """Collapse HTML email bodies into readable plain text (stdlib only).
+
+    Drops ``<script>``/``<style>`` content, turns block-level tags into line
+    breaks, and appends ``http(s)`` link targets after their text so URLs
+    survive the conversion (``label (https://...)``). Used to avoid shipping a
+    full HTML body — markup, inline CSS and all — back through the context when
+    the plain-text alternative is missing.
+    """
+
+    _BLOCK = {
+        "p", "div", "br", "tr", "li", "h1", "h2", "h3", "h4", "h5", "h6",
+        "table", "ul", "ol", "blockquote", "section", "article", "header", "footer",
+    }  # fmt: skip
+    _SKIP = {"script", "style", "head", "title"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._parts: list[str] = []
+        self._skip = 0
+        self._href: str | None = None
+        self._link_text: list[str] = []
+        self._in_link = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in self._SKIP:
+            self._skip += 1
+        elif tag == "a":
+            href = dict(attrs).get("href") or ""
+            self._href = href if href.startswith(("http://", "https://")) else None
+            self._in_link = True
+            self._link_text = []
+        elif tag in self._BLOCK:
+            self._parts.append("\n")
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "br":
+            self._parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in self._SKIP:
+            self._skip = max(0, self._skip - 1)
+        elif tag == "a" and self._in_link:
+            text = "".join(self._link_text).strip()
+            if self._href and self._href != text:
+                self._parts.append(f"{text} ({self._href})" if text else self._href)
+            else:
+                self._parts.append(text)
+            self._in_link = False
+            self._href = None
+            self._link_text = []
+        elif tag in self._BLOCK:
+            self._parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if self._skip:
+            return
+        if self._in_link:
+            self._link_text.append(data)
+        else:
+            self._parts.append(data)
+
+    def get_text(self) -> str:
+        lines = [re.sub(r"[ \t]+", " ", ln).strip() for ln in "".join(self._parts).splitlines()]
+        return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+
+
+def _html_to_text(html: str) -> str:
+    """Extract readable plain text from an HTML email body.
+
+    Never raises: on any parser failure it falls back to a bare tag strip so a
+    malformed body can't break a tool call.
+    """
+    try:
+        parser = _HTMLToText()
+        parser.feed(html)
+        parser.close()
+        return parser.get_text()
+    except Exception:
+        return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html)).strip()
+
+
+def _dump_email(email: Email) -> dict[str, Any]:
+    """Serialize an Email for tool output with a single plain-text body.
+
+    ``body_text`` and ``body_html`` are two renderings of the same message, so
+    returning both ships redundant markup. We keep the plain text and drop the
+    raw HTML; when only HTML is present, its text is extracted so no content is
+    lost. Header-only listings have empty bodies, so this is a no-op there.
+    """
+    data = _dump(email)
+    html = data.pop("body_html", "")
+    if not data.get("body_text") and html:
+        text = _html_to_text(html)
+        if text:
+            data["body_text"] = text
+    return data
+
+
 @mcp.tool()
 async def list_folders(ctx: Context) -> list[dict[str, Any]]:  # type: ignore[type-arg]
     """List all available iCloud Mail folders."""
     app = _get_ctx(ctx)
     folders = await app.imap_client.list_folders()
-    return [f.model_dump() for f in folders]
+    return [_dump(f) for f in folders]
 
 
 @mcp.tool()
@@ -104,7 +249,7 @@ async def list_emails(
         folder=folder, limit=limit, offset=offset, sort_order=sort_order
     )
     return {
-        "emails": [e.model_dump(mode="json") for e in result.emails],
+        "emails": [_dump_email(e) for e in result.emails],
         "total_count": result.total_count,
     }
 
@@ -114,7 +259,7 @@ async def get_email(ctx: Context, folder: str, uid: str) -> dict[str, Any]:  # t
     """Fetch a complete email by UID including full body and attachment metadata."""
     app = _get_ctx(ctx)
     email_obj = await app.imap_client.get_email(folder=folder, uid=uid)
-    return email_obj.model_dump(mode="json")
+    return _dump_email(email_obj)
 
 
 @mcp.tool()
@@ -178,7 +323,7 @@ async def search_emails(
         limit=limit,
     )
     emails = await app.imap_client.search_emails(query=query)
-    return [e.model_dump(mode="json") for e in emails]
+    return [_dump_email(e) for e in emails]
 
 
 @mcp.tool()
@@ -276,7 +421,7 @@ async def create_folder(ctx: Context, name: str) -> dict[str, Any]:  # type: ign
     """Create a new iCloud Mail folder."""
     app = _get_ctx(ctx)
     folder = await app.imap_client.create_folder(name=name)
-    return folder.model_dump()
+    return _dump(folder)
 
 
 @mcp.tool()
@@ -284,7 +429,7 @@ async def rename_folder(ctx: Context, old_name: str, new_name: str) -> dict[str,
     """Rename an existing iCloud Mail folder."""
     app = _get_ctx(ctx)
     folder = await app.imap_client.rename_folder(old_name=old_name, new_name=new_name)
-    return folder.model_dump()
+    return _dump(folder)
 
 
 @mcp.tool()
@@ -307,7 +452,7 @@ async def list_attachments(
     """
     app = _get_ctx(ctx)
     attachments = await app.imap_client.list_attachments(folder=folder, uid=uid)
-    return [a.model_dump() for a in attachments]
+    return [_dump(a) for a in attachments]
 
 
 @mcp.tool()
@@ -315,7 +460,7 @@ async def get_folder_stats(ctx: Context, folder: str = "INBOX") -> dict[str, Any
     """Get statistics for an iCloud Mail folder (total and unread message counts)."""
     app = _get_ctx(ctx)
     stats = await app.imap_client.get_folder_stats(folder=folder)
-    return stats.model_dump()
+    return _dump(stats)
 
 
 @mcp.tool()
@@ -388,7 +533,7 @@ async def list_rules(ctx: Context) -> list[dict[str, Any]]:  # type: ignore[type
     """List all email filtering rules."""
     app = _get_ctx(ctx)
     rules = app.rules_engine.list_rules()
-    return [r.model_dump() for r in rules]
+    return [_dump(r) for r in rules]
 
 
 @mcp.tool()
@@ -405,7 +550,7 @@ async def create_rule(
     """
     app = _get_ctx(ctx)
     rule = app.rules_engine.create_rule(name=name, conditions=conditions, actions=actions)
-    return rule.model_dump()
+    return _dump(rule)
 
 
 @mcp.tool()
@@ -456,7 +601,7 @@ async def list_calendars(ctx: Context) -> list[dict[str, Any]]:  # type: ignore[
     """List all iCloud calendars that support events."""
     app = _get_ctx(ctx)
     calendars = await app.caldav_client.list_calendars()
-    return [c.model_dump() for c in calendars]
+    return [_dump(c) for c in calendars]
 
 
 @mcp.tool()
@@ -480,7 +625,7 @@ async def list_events(
     start_dt = _parse_datetime(start, "start")
     end_dt = _parse_datetime(end, "end")
     events = await app.caldav_client.list_events(calendar=calendar, start=start_dt, end=end_dt)
-    return [e.model_dump(mode="json") for e in events]
+    return [_dump(e, exclude=_EVENT_INTERNAL_FIELDS) for e in events]
 
 
 @mcp.tool()
@@ -488,7 +633,7 @@ async def get_event(ctx: Context, calendar: str, uid: str) -> dict[str, Any]:  #
     """Fetch a single calendar event by its iCalendar UID."""
     app = _get_ctx(ctx)
     event = await app.caldav_client.get_event(calendar=calendar, uid=uid)
-    return event.model_dump(mode="json")
+    return _dump(event, exclude=_EVENT_INTERNAL_FIELDS)
 
 
 @mcp.tool()
@@ -527,7 +672,7 @@ async def create_event(
         description=description,
         rrule=rrule,
     )
-    return event.model_dump(mode="json")
+    return _dump(event, exclude=_EVENT_INTERNAL_FIELDS)
 
 
 @mcp.tool()
@@ -561,7 +706,7 @@ async def update_event(
         description=description,
         rrule=rrule,
     )
-    return event.model_dump(mode="json")
+    return _dump(event, exclude=_EVENT_INTERNAL_FIELDS)
 
 
 @mcp.tool()
@@ -607,7 +752,7 @@ async def update_occurrence(
         location=location,
         description=description,
     )
-    return event.model_dump(mode="json")
+    return _dump(event, exclude=_EVENT_INTERNAL_FIELDS)
 
 
 @mcp.tool()
@@ -641,7 +786,7 @@ async def list_reminder_lists(ctx: Context) -> list[dict[str, Any]]:  # type: ig
     """List all iCloud Reminders lists (native macOS Reminders lists)."""
     app = _get_ctx(ctx)
     lists = await app.eventkit_client.list_reminder_lists()
-    return [r.model_dump() for r in lists]
+    return [_dump(r) for r in lists]
 
 
 @mcp.tool()
@@ -660,7 +805,7 @@ async def list_reminders(
     reminders = await app.eventkit_client.list_reminders(
         list=list, include_completed=include_completed
     )
-    return [r.model_dump(mode="json") for r in reminders]
+    return [_dump(r) for r in reminders]
 
 
 @mcp.tool()
@@ -695,7 +840,7 @@ async def search_reminders(
         undated=undated,
         lists=lists,
     )
-    return [r.model_dump(mode="json") for r in reminders]
+    return [_dump(r) for r in reminders]
 
 
 @mcp.tool()
@@ -703,7 +848,7 @@ async def get_reminder(ctx: Context, list: str, uid: str) -> dict[str, Any]:  # 
     """Fetch a single reminder by its iCalendar UID."""
     app = _get_ctx(ctx)
     reminder = await app.eventkit_client.get_reminder(list=list, uid=uid)
-    return reminder.model_dump(mode="json")
+    return _dump(reminder)
 
 
 @mcp.tool()
@@ -749,7 +894,7 @@ async def create_reminder(
         rrule=rrule,
         alarms=_parse_alarms_arg(alarms),
     )
-    return reminder.model_dump(mode="json")
+    return _dump(reminder)
 
 
 @mcp.tool()
@@ -796,7 +941,7 @@ async def update_reminder(
         alarms=_parse_alarms_arg(alarms),
         clear=clear,
     )
-    return reminder.model_dump(mode="json")
+    return _dump(reminder)
 
 
 @mcp.tool()
@@ -804,7 +949,7 @@ async def complete_reminder(ctx: Context, list: str, uid: str) -> dict[str, Any]
     """Mark a reminder as completed."""
     app = _get_ctx(ctx)
     reminder = await app.eventkit_client.complete_reminder(list=list, uid=uid)
-    return reminder.model_dump(mode="json")
+    return _dump(reminder)
 
 
 @mcp.tool()
@@ -812,7 +957,7 @@ async def reopen_reminder(ctx: Context, list: str, uid: str) -> dict[str, Any]: 
     """Reopen a completed reminder (back to needs-action)."""
     app = _get_ctx(ctx)
     reminder = await app.eventkit_client.reopen_reminder(list=list, uid=uid)
-    return reminder.model_dump(mode="json")
+    return _dump(reminder)
 
 
 @mcp.tool()
@@ -834,7 +979,7 @@ async def move_reminder(
     reminder = await app.eventkit_client.move_reminder(
         uid=uid, from_list=from_list, to_list=to_list
     )
-    return reminder.model_dump(mode="json")
+    return _dump(reminder)
 
 
 @mcp.tool()
@@ -851,7 +996,7 @@ async def create_reminder_list(
     """
     app = _get_ctx(ctx)
     rlist = await app.eventkit_client.create_reminder_list(name=name, color=color)
-    return rlist.model_dump()
+    return _dump(rlist)
 
 
 @mcp.tool()
@@ -859,7 +1004,7 @@ async def rename_reminder_list(ctx: Context, name: str, new_name: str) -> dict[s
     """Rename an existing Reminders list."""
     app = _get_ctx(ctx)
     rlist = await app.eventkit_client.rename_reminder_list(name=name, new_name=new_name)
-    return rlist.model_dump()
+    return _dump(rlist)
 
 
 @mcp.tool()

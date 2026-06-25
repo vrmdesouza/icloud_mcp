@@ -22,6 +22,10 @@ from icloud_mcp.models import (
 from icloud_mcp.rules import RulesEngine
 from icloud_mcp.server import (
     AppContext,
+    _compact,
+    _dump,
+    _dump_email,
+    _html_to_text,
     app_lifespan,
     apply_rules,
     bulk_action,
@@ -72,6 +76,112 @@ from icloud_mcp.server import (
     update_reminder,
 )
 
+# -- Output compaction helpers ---------------------------------------------
+
+
+def test_compact_drops_empty_values() -> None:
+    """_compact removes None, empty strings and empty collections."""
+    data = {
+        "uid": "1",
+        "subject": "",
+        "body_html": "",
+        "cc": [],
+        "attachments": [],
+        "message_id": None,
+        "meta": {},
+    }
+    assert _compact(data) == {"uid": "1"}
+
+
+def test_compact_preserves_meaningful_falsy() -> None:
+    """_compact keeps False and 0 — they carry information (unread, priority none)."""
+    data = {"is_read": False, "priority": 0, "completed": False}
+    assert _compact(data) == {"is_read": False, "priority": 0, "completed": False}
+
+
+def test_compact_recurses_into_lists_and_dicts() -> None:
+    """_compact strips empties nested inside lists and dicts."""
+    data = {
+        "emails": [
+            {"uid": "1", "subject": "Hi", "cc": [], "reply_to": None},
+            {"uid": "2", "subject": "", "to": ["a@b.com"]},
+        ],
+    }
+    assert _compact(data) == {
+        "emails": [
+            {"uid": "1", "subject": "Hi"},
+            {"uid": "2", "to": ["a@b.com"]},
+        ],
+    }
+
+
+def test_dump_excludes_named_fields() -> None:
+    """_dump(exclude=...) drops internal plumbing such as a calendar event href/etag."""
+    event = CalendarEvent(
+        uid="e1",
+        calendar="Work",
+        summary="Standup",
+        start=datetime(2026, 6, 1, 9, tzinfo=UTC),
+        end=datetime(2026, 6, 1, 9, 30, tzinfo=UTC),
+        href="https://p1/cal/work/e1.ics",
+        etag="etag-123",
+    )
+    dumped = _dump(event, exclude={"href", "etag"})
+    assert "href" not in dumped
+    assert "etag" not in dumped
+    assert dumped["uid"] == "e1"
+
+
+def test_html_to_text_extracts_readable_text() -> None:
+    """_html_to_text drops markup/CSS, keeps text, and preserves link URLs."""
+    html = (
+        "<html><head><style>body{color:red}</style></head><body>"
+        "<h1>Fatura</h1><p>Total: <strong>R$ 10</strong></p>"
+        "<a href='https://banco.com/pagar?id=1'>Pagar agora</a>"
+        "<script>track()</script></body></html>"
+    )
+    text = _html_to_text(html)
+    assert "color:red" not in text  # CSS dropped
+    assert "track()" not in text  # script dropped
+    assert "Fatura" in text and "Total: R$ 10" in text
+    assert "Pagar agora (https://banco.com/pagar?id=1)" in text  # link URL kept
+
+
+def test_dump_email_keeps_text_drops_html() -> None:
+    """When body_text exists, the redundant raw HTML is dropped from output."""
+    email = Email(
+        uid="1",
+        folder="INBOX",
+        subject="Hi",
+        body_text="Plain body.",
+        body_html="<p>Plain body.</p>",
+    )
+    data = _dump_email(email)
+    assert data["body_text"] == "Plain body."
+    assert "body_html" not in data
+
+
+def test_dump_email_extracts_text_when_only_html() -> None:
+    """An HTML-only email yields readable text and never a raw body_html field."""
+    email = Email(
+        uid="2",
+        folder="INBOX",
+        subject="Hi",
+        body_html="<div>Hello <b>world</b></div>",
+    )
+    data = _dump_email(email)
+    assert "body_html" not in data
+    assert data["body_text"] == "Hello world"
+
+
+def test_dump_email_noop_for_headers_only() -> None:
+    """Header-only listings (empty bodies) carry no body fields after compaction."""
+    email = Email(uid="3", folder="INBOX", subject="Hi", sender="a@b.com")
+    data = _dump_email(email)
+    assert "body_html" not in data
+    assert "body_text" not in data
+
+
 MockCtx = tuple[MagicMock, AsyncMock, AsyncMock, RulesEngine]
 
 
@@ -101,9 +211,10 @@ async def test_list_folders_tool(mock_ctx: MockCtx) -> None:
 
     result = await list_folders(ctx)
 
+    # Empty ``flags`` lists are stripped from tool output to save tokens.
     assert result == [
-        {"name": "INBOX", "delimiter": "/", "flags": []},
-        {"name": "Sent", "delimiter": "/", "flags": []},
+        {"name": "INBOX", "delimiter": "/"},
+        {"name": "Sent", "delimiter": "/"},
     ]
     imap_client.list_folders.assert_called_once()
 
@@ -801,7 +912,9 @@ async def test_list_reminder_lists_tool(mock_ctx: MockCtx) -> None:
 
     result = await list_reminder_lists(ctx)
 
-    assert result == [{"name": "Tasks", "identifier": "r-tasks", "color": None, "read_only": False}]
+    # A ``None`` color is stripped from tool output; ``read_only`` (a meaningful
+    # boolean) is preserved even when False.
+    assert result == [{"name": "Tasks", "identifier": "r-tasks", "read_only": False}]
     eventkit.list_reminder_lists.assert_called_once()
 
 
